@@ -7,10 +7,73 @@ from collections import defaultdict
 from tqdm import tqdm
 
 # --- Configuration ---
+# -- VM --
+#RPC_URL = "http://localhost:8545"  # ethereum2
+#START_BLOCK = 22699600   # June 14th 2025
+#END_BLOCK = 23300300  # Sept 5th 2025
+# -- local --
 RPC_URL = "http://10.9.0.35:8545"  # ethereum2
-START_BLOCK = 20328000   # July 17th 2025
-END_BLOCK = 20340000  # July 19th 2025
-BLOCK_BATCH_SIZE = 100  # number of blocks to query concurrently
+START_BLOCK = 22700000   
+END_BLOCK = 22720000  
+BLOCK_BATCH_SIZE = 200  # number of blocks to query concurrently
+CHUNK_SIZE = 10000  # number of blocks to process before writing to CSV
+
+# DeFi Protocol addresses (main contracts)
+DEFI_PROTOCOLS = {
+    "aave": [
+        "0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9",  # Aave V2 Pool
+        "0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2",  # Aave V3 Pool
+    ],
+    "compound": [
+        "0x39AA39c021dfbaE8faC545936693aC917d5E7563",  # Compound Comptroller
+        # "0xc00e94cb662c3520282e6f5717214004a7f26888",  # Compound Token
+    ],
+    "uniswap": [ # https://docs.uniswap.org/contracts/v3/reference/deployments/ethereum-deployments
+        #  https://docs.uniswap.org/contracts/v2/reference/smart-contracts/v2-deployments
+        # "0x1f98431c8ad98523631ae4a59f267346ea31f984",  # Uniswap V3 Factory
+        "0xE592427A0AEce92De3Edee1F18E0157C05861564",  # Uniswap V3 Router
+        "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",  # Uniswap V2 Router
+    ],
+    "lido": [
+        "0xAE7ab96520DE3A18E5e111B5EaAb095312d7FE84",  # Lido stETH
+        "0xdc24316b9ae028f1497c275eb9192a3ea0f67022",  # Lido stETH Curve Pool
+    ],
+    "curve": [
+        "0xbebc44782c7db0a1a60cb6fe97d0b483032ff1c7",  # Curve 3pool
+        "0xa2b47e3d5c8c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",  # Curve Registry
+    ],
+    "dydx": [
+        "0x1e0447b19bb6ecfdae1e4ae1694b0c3659614e4e",  # dYdX Solo Margin
+        # "0x4ec4ba6e9bb1e416b70419c1a96c319c12f98234",  # dYdX Perpetual
+    ]
+    #"morpho": [
+    #    "0x58D97B57BB95320F9a05dC918Aef65434969c2B2",  # Morpho Protocol
+    #]
+}
+
+# ROLLUP Protocol addresses
+ROLLUP_PROTOCOLS = {
+    "arbitrum": [  # https://docs.arbitrum.io/build-decentralized-apps/reference/contract-addresses
+        "0x8315177aB297bA92A06054cE80a67Ed4DBd7ed3a",  # Arbitrum One Bridge
+        "0xC1Ebd02f738644983b6C4B2d440b8e77DdE276Bd",  # Arbitrum Nova Bridge
+        "0x0B9857ae2D4A3DBe74ffE1d7DF045bb7F96E4840",  # Arbitrum One Outbox
+        "0xD4B80C3D7240325D18E645B49e6535A3Bf95cc58",  # Arbitrum Nova Outbox
+        "0x912CE59144191C1204E64559FE8253a0e49E6548",  # Arbitrum One Delayed Inbox
+        "0xc4448b71118c9071Bcb9734A0EAc55D18A153949",  # Arbitrum Nova Delayed Inbox
+    ],
+    "base": [  #https://docs.base.org/base-chain/network-information/base-contracts#ethereum-mainnet
+        "0x3154Cf16ccdb4C6d922629664174b904d80F2C35",  # Base Bridge
+    ],
+    "optimism": [  # https://docs.optimism.io/reference/addresses
+        "0x99C9fc46f92E8a1c0deC1b1747d010903E884bE1",  # Optimism Bridge Proxy
+    ],
+    #"polygon": [
+    #    "0x7D1AfA7B718fb893dB30A3aBc0Cfc608AaCfeBB0",  # Polygon Bridge
+    #],
+    "unichain": [  #https://docs.unichain.org/docs/technical-information/contract-addresses
+        "0x81014f44b0a345033bb2b3b21c7a1a308b35feea",  # Unichain Bridge
+    ]
+}
 
 # Stablecoin configurations
 STABLECOINS = {
@@ -29,18 +92,13 @@ STABLECOINS = {
         "decimals": 6,
         "symbol": "PYUSD"
     },
-    "busd": {
-        "address": "0x4Fabb145d64652a948d72533023f6E7A623C7C53".lower(),
-        "decimals": 18,
-        "symbol": "BUSD"
-    },
-    "dai": {
-        "address": "0x6B175474E89094C44Da98b954EedeAC495271d0F".lower(),
-        "decimals": 18,
-        "symbol": "DAI"
-    },
+    # "dai": {
+    #     "address": "0x6B175474E89094C44Da98b954EedeAC495271d0F".lower(),
+    #     "decimals": 18,
+    #     "symbol": "DAI"
+    # },
     "eurc": {
-        "address": "0x1aBaEA1f7C830cD89Eff2d4bB2882FbC54A9Ec56".lower(),
+        "address": "0x1aBaEA1f7C830bD89Acc67eC4af516284b1bC33c".lower(),
         "decimals": 6,
         "symbol": "EURC"
     }
@@ -64,6 +122,90 @@ async def rpc_call(session, method, params=None):
     }) as resp:
         result = await resp.json()
         return result["result"]
+
+
+def write_transfers_chunk(transfers, output_file, is_first_chunk=False):
+    """Write a chunk of transfers to CSV file"""
+    if not transfers:
+        return
+    
+    mode = 'w' if is_first_chunk else 'a'
+    with open(output_file, mode, newline='') as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "block_number", "timestamp", "tx_hash",
+                "from", "to", "amount", "is_defi_transaction", "is_rollup_transaction"
+            ]
+        )
+        if is_first_chunk:
+            writer.writeheader()
+        writer.writerows(transfers)
+
+
+def write_daily_stats_chunk(daily_data, daily_stats_file, is_first_chunk=False):
+    """Write daily stats chunk to CSV file"""
+    if not daily_data:
+        return
+    
+    mode = 'w' if is_first_chunk else 'a'
+    with open(daily_stats_file, mode, newline='') as f:
+        writer = csv.writer(f)
+        if is_first_chunk:
+            # Extract stablecoin name from filename
+            stablecoin_name = daily_stats_file.replace("_daily_stats.csv", "")
+            writer.writerow([
+                "date", f"total_volume_{stablecoin_name}", "transaction_count",
+                "transfer_count", f"avg_transfer_size_{stablecoin_name}",
+                "different_addresses", "defi_transaction_count", "rollup_transaction_count"
+            ])
+        
+        for date in sorted(daily_data.keys()):
+            avg_transfer = (
+                daily_data[date]["volume"] /
+                daily_data[date]["transfer_count"]
+            )
+            writer.writerow([
+                date,
+                f"{daily_data[date]['volume']:.2f}",
+                len(daily_data[date]["tx_hashes"]),
+                daily_data[date]["transfer_count"],
+                f"{avg_transfer:.2f}",
+                len(daily_data[date]["different_addresses"]),
+                len(daily_data[date]["defi_tx_hashes"]),
+                len(daily_data[date]["rollup_tx_hashes"])
+            ])
+
+
+def is_defi_protocol(address):
+    """Check if an address belongs to any DeFi protocol"""
+    address_lower = address.lower()
+    
+    # Check DeFi protocols
+    for protocol, addresses in DEFI_PROTOCOLS.items():
+        for protocol_address in addresses:
+            if address_lower == protocol_address.lower():
+                return True
+    
+    return False
+
+
+def is_rollup_protocol(address):
+    """Check if an address belongs to any ROLLUP protocol"""
+    address_lower = address.lower()
+    
+    # Check ROLLUP protocols
+    for protocol, addresses in ROLLUP_PROTOCOLS.items():
+        for protocol_address in addresses:
+            if address_lower == protocol_address.lower():
+                return True
+    
+    return False
+
+
+def is_defi_or_rollup_protocol(address):
+    """Check if an address belongs to any DeFi or ROLLUP protocol"""
+    return is_defi_protocol(address) or is_rollup_protocol(address)
 
 
 def parse_transfer_log(log, tx_hash, block_number, timestamp,
@@ -91,7 +233,11 @@ def parse_transfer_log(log, tx_hash, block_number, timestamp,
         "tx_hash": tx_hash,
         "from": from_address,
         "to": to_address,
-        "amount": amount_tokens
+        "amount": amount_tokens,
+        "is_defi_transaction": (is_defi_protocol(from_address) or
+                                is_defi_protocol(to_address)),
+        "is_rollup_transaction": (is_rollup_protocol(from_address) or
+                                  is_rollup_protocol(to_address))
     }
 
 
@@ -153,7 +299,7 @@ def parse_arguments():
         epilog="""
 Examples:
   python stats.py --usdc          # Analyze USDC only
-  python stats.py --usdt --dai    # Analyze USDT and DAI
+  # python stats.py --usdt --dai    # Analyze USDT and DAI
   python stats.py --all            # Analyze all stablecoins
         """
     )
@@ -162,7 +308,6 @@ Examples:
     parser.add_argument("--usdc", action="store_true", help="Analyze USDC")
     parser.add_argument("--usdt", action="store_true", help="Analyze USDT")
     parser.add_argument("--pyusd", action="store_true", help="Analyze PYUSD")
-    parser.add_argument("--busd", action="store_true", help="Analyze BUSD")
     parser.add_argument("--dai", action="store_true", help="Analyze DAI")
     parser.add_argument("--eurc", action="store_true", help="Analyze EURC")
     parser.add_argument("--all", action="store_true",
@@ -204,7 +349,7 @@ def analyze_stablecoin_data(stablecoin_name, stablecoin_config, all_transfers):
                 f,
                 fieldnames=[
                     "block_number", "timestamp", "tx_hash",
-                    "from", "to", "amount"
+                    "from", "to", "amount", "is_defi_transaction"
                 ]
             )
             writer.writeheader()
@@ -217,18 +362,25 @@ def analyze_stablecoin_data(stablecoin_name, stablecoin_config, all_transfers):
         # Calculate overall stats
         total_volume = sum(t["amount"] for t in all_transfers)
         unique_txs = len(set(t["tx_hash"] for t in all_transfers))
+        defi_txs = len(set(t["tx_hash"] for t in all_transfers
+                           if t["is_defi_transaction"]))
+        rollup_txs = len(set(t["tx_hash"] for t in all_transfers
+                             if t["is_rollup_transaction"]))
 
-        # Calculate unique addresses (both from and to)
-        unique_addresses = set()
+        # Calculate different addresses (both from and to)
+        different_addresses = set()
         for t in all_transfers:
-            unique_addresses.add(t["from"].lower())
-            unique_addresses.add(t["to"].lower())
+            different_addresses.add(t["from"].lower())
+            different_addresses.add(t["to"].lower())
 
         # Calculate daily stats
         daily_data = defaultdict(lambda: {
             "volume": 0,
             "tx_hashes": set(),
-            "transfer_count": 0
+            "transfer_count": 0,
+            "different_addresses": set(),
+            "defi_tx_hashes": set(),
+            "rollup_tx_hashes": set()
         })
 
         for t in all_transfers:
@@ -236,13 +388,22 @@ def analyze_stablecoin_data(stablecoin_name, stablecoin_config, all_transfers):
             daily_data[date]["volume"] += t["amount"]
             daily_data[date]["tx_hashes"].add(t["tx_hash"])
             daily_data[date]["transfer_count"] += 1
+            daily_data[date]["different_addresses"].add(t["from"].lower())
+            daily_data[date]["different_addresses"].add(t["to"].lower())
+
+            # Track DeFi and rollup transactions separately
+            if t["is_defi_transaction"]:
+                daily_data[date]["defi_tx_hashes"].add(t["tx_hash"])
+            if t["is_rollup_transaction"]:
+                daily_data[date]["rollup_tx_hashes"].add(t["tx_hash"])
 
         # Write daily stats to CSV
         with open(daily_stats_file, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
                 "date", f"total_volume_{stablecoin_name}", "transaction_count",
-                "transfer_count", f"avg_transfer_size_{stablecoin_name}"
+                "transfer_count", f"avg_transfer_size_{stablecoin_name}",
+                "different_addresses", "defi_transaction_count", "rollup_transaction_count"
             ])
             for date in sorted(daily_data.keys()):
                 avg_transfer = (
@@ -254,7 +415,10 @@ def analyze_stablecoin_data(stablecoin_name, stablecoin_config, all_transfers):
                     f"{daily_data[date]['volume']:.2f}",
                     len(daily_data[date]["tx_hashes"]),
                     daily_data[date]["transfer_count"],
-                    f"{avg_transfer:.2f}"
+                    f"{avg_transfer:.2f}",
+                    len(daily_data[date]["different_addresses"]),
+                    len(daily_data[date]["defi_tx_hashes"]),
+                    len(daily_data[date]["rollup_tx_hashes"])
                 ])
 
         print(f"✓ Daily statistics written to {daily_stats_file}")
@@ -267,7 +431,9 @@ def analyze_stablecoin_data(stablecoin_name, stablecoin_config, all_transfers):
         print(f"  Total {stablecoin_config['symbol']} transfers: "
               f"{len(all_transfers):,}")
         print(f"  Unique transactions: {unique_txs:,}")
-        print(f"  Unique addresses: {len(unique_addresses):,}")
+        print(f"  DeFi transactions: {defi_txs:,}")
+        print(f"  Rollup transactions: {rollup_txs:,}")
+        print(f"  Different addresses: {len(different_addresses):,}")
 
         # Use appropriate currency symbol
         currency_symbol = "€" if stablecoin_config['symbol'] == "EURC" else "$"
@@ -303,39 +469,132 @@ async def main():
     symbols = [STABLECOINS[s]['symbol'] for s in selected_stablecoins]
     print(f"Analyzing stablecoins: {', '.join(symbols)}")
     print(f"Processing blocks {START_BLOCK} to {END_BLOCK}")
+    print(f"Using chunk size: {CHUNK_SIZE} blocks per chunk")
 
-    # Initialize aggregated transfers for each stablecoin
-    aggregated_transfers = {name: [] for name in selected_stablecoins}
+    # Initialize output files for each stablecoin
+    for stablecoin_name in selected_stablecoins:
+        output_file = f"{stablecoin_name}_transfers.csv"
+        daily_stats_file = f"{stablecoin_name}_daily_stats.csv"
+        
+        # Clear existing files
+        import os
+        if os.path.exists(output_file):
+            os.remove(output_file)
+        if os.path.exists(daily_stats_file):
+            os.remove(daily_stats_file)
 
+    # Process blocks in chunks to reduce memory usage
+    chunk_count = 0
+    total_blocks_processed = 0
+    
+    # Initialize global daily stats aggregation
+    global_daily_stats = {
+        name: defaultdict(lambda: {
+            "volume": 0,
+            "tx_hashes": set(),
+            "transfer_count": 0,
+            "different_addresses": set(),
+            "defi_tx_hashes": set(),
+            "rollup_tx_hashes": set()
+        }) for name in selected_stablecoins
+    }
+    
     async with aiohttp.ClientSession() as session:
-        # Process blocks in batches
-        for batch_start in range(
-            START_BLOCK, END_BLOCK + 1, BLOCK_BATCH_SIZE
-        ):
-            batch_end = min(batch_start + BLOCK_BATCH_SIZE - 1, END_BLOCK)
-            tasks = [
-                process_block(session, b, selected_stablecoins)
-                for b in range(batch_start, batch_end + 1)
-            ]
+        for chunk_start in range(START_BLOCK, END_BLOCK + 1, CHUNK_SIZE):
+            chunk_end = min(chunk_start + CHUNK_SIZE - 1, END_BLOCK)
+            chunk_count += 1
+            
+            print(f"\nProcessing chunk {chunk_count}: blocks {chunk_start}-{chunk_end}")
+            
+            # Initialize chunk data for each stablecoin
+            chunk_transfers = {name: [] for name in selected_stablecoins}
+            chunk_daily_stats = {
+                name: defaultdict(lambda: {
+                    "volume": 0,
+                    "tx_hashes": set(),
+                    "transfer_count": 0,
+                    "different_addresses": set(),
+                    "defi_tx_hashes": set(),
+                    "rollup_tx_hashes": set()
+                }) for name in selected_stablecoins
+            }
+            
+            # Process blocks in this chunk
+            for batch_start in range(chunk_start, chunk_end + 1, BLOCK_BATCH_SIZE):
+                batch_end = min(batch_start + BLOCK_BATCH_SIZE - 1, chunk_end)
+                tasks = [
+                    process_block(session, b, selected_stablecoins)
+                    for b in range(batch_start, batch_end + 1)
+                ]
 
-            results = await asyncio.gather(*tasks)
+                results = await asyncio.gather(*tasks)
+                total_blocks_processed += len(results)
 
-            # Process results and aggregate transfers
-            for block_transfers in tqdm(
-                results,
-                total=len(results),
-                desc=f"Blocks {batch_start}-{batch_end}"
-            ):
-                for stablecoin_name in selected_stablecoins:
-                    aggregated_transfers[stablecoin_name].extend(
-                        block_transfers.get(stablecoin_name, [])
-                    )
+                # Process results and aggregate transfers for this chunk
+                for block_transfers in tqdm(
+                    results,
+                    total=len(results),
+                    desc=f"Batch {batch_start}-{batch_end}"
+                ):
+                    for stablecoin_name in selected_stablecoins:
+                        transfers = block_transfers.get(stablecoin_name, [])
+                        chunk_transfers[stablecoin_name].extend(transfers)
+                        
+                        # Update global daily stats (aggregate across all chunks)
+                        for transfer in transfers:
+                            date = datetime.fromtimestamp(transfer["timestamp"]).strftime("%Y-%m-%d")
+                            global_daily_stats[stablecoin_name][date]["volume"] += transfer["amount"]
+                            global_daily_stats[stablecoin_name][date]["tx_hashes"].add(transfer["tx_hash"])
+                            global_daily_stats[stablecoin_name][date]["transfer_count"] += 1
+                            global_daily_stats[stablecoin_name][date]["different_addresses"].add(transfer["from"].lower())
+                            global_daily_stats[stablecoin_name][date]["different_addresses"].add(transfer["to"].lower())
+                            
+                            if transfer["is_defi_transaction"]:
+                                global_daily_stats[stablecoin_name][date]["defi_tx_hashes"].add(transfer["tx_hash"])
+                            if transfer["is_rollup_transaction"]:
+                                global_daily_stats[stablecoin_name][date]["rollup_tx_hashes"].add(transfer["tx_hash"])
+            
+            # Write transfers chunk data to CSV files
+            for stablecoin_name in selected_stablecoins:
+                if chunk_transfers[stablecoin_name]:
+                    output_file = f"{stablecoin_name}_transfers.csv"
+                    
+                    # Write transfers chunk
+                    write_transfers_chunk(chunk_transfers[stablecoin_name], output_file, 
+                                        is_first_chunk=(chunk_count == 1))
+                    
+                    print(f"  ✓ {stablecoin_name.upper()}: {len(chunk_transfers[stablecoin_name])} transfers")
+            
+            # Clear chunk transfers data to free memory (keep global daily stats)
+            chunk_transfers.clear()
+            
+            print(f"✓ Chunk {chunk_count} completed. Total blocks processed: {total_blocks_processed}")
 
-    # Analyze each stablecoin's data
+    # Write final aggregated daily stats to CSV files
+    print(f"\nWriting aggregated daily statistics...")
+    for stablecoin_name in selected_stablecoins:
+        daily_stats_file = f"{stablecoin_name}_daily_stats.csv"
+        write_daily_stats_chunk(global_daily_stats[stablecoin_name], daily_stats_file, is_first_chunk=True)
+        print(f"  ✓ {stablecoin_name.upper()}: Daily stats written")
+
+    # Generate final summary statistics
+    print(f"\n{'='*60}")
+    print("FINAL SUMMARY")
+    print(f"{'='*60}")
+    
     for stablecoin_name in selected_stablecoins:
         stablecoin_config = STABLECOINS[stablecoin_name]
-        analyze_stablecoin_data(stablecoin_name, stablecoin_config,
-                                aggregated_transfers[stablecoin_name])
+        output_file = f"{stablecoin_name}_transfers.csv"
+        
+        # Count total transfers from file
+        total_transfers = 0
+        if os.path.exists(output_file):
+            with open(output_file, 'r') as f:
+                total_transfers = sum(1 for line in f) - 1  # Subtract header
+        
+        print(f"{stablecoin_config['symbol']}: {total_transfers:,} total transfers")
+    
+    print(f"\nAnalysis complete! Processed {total_blocks_processed} blocks in {chunk_count} chunks.")
 
 
 if __name__ == "__main__":
