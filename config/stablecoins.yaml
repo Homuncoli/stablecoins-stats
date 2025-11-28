@@ -1,0 +1,36 @@
+stablecoins:
+    usdc: 
+        address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+        symbol: "USDC"
+        decimals: 6
+    usdt:
+        address: "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+        decimals: 6
+        symbol: "USDT"
+    usde:
+        address: "0x4c9EDD5852cd905f086C759E8383e09bff1E68B3"
+        decimals: 18
+        symbol: "USDE"
+    pyusd:
+        address: "0x6c3ea9036406852006290770BEdFcAbA0e23A0e8"
+        decimals: 6
+        symbol: "PYUSD"
+    dai:
+        address: "0x6b175474e89094c44da98b954eedeac495271d0f"
+        decimals: 18
+        symbol: "DAI"
+    frax:
+        address: "0x853d955acef822db058eb8505911ed77f175b99e"
+        decimals: 18
+        symbol: "FRAX"
+    eurc:
+        address: "0x1aBaEA1f7C830bD89Acc67eC4af516284b1bC33c"
+        decimals: 6
+        symbol: "EURC"
+    eurt:
+        address: "0xC581b735A1688071A1746c968e0798D642EDE491"
+        decimals: 6
+        symbol: "EURT"
+
+
+    

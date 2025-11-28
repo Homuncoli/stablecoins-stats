@@ -6,104 +6,47 @@ from datetime import datetime
 from collections import defaultdict
 from tqdm import tqdm
 import config_env
+import yaml
 
-# --- Configuration ---
-# -- VM --
-#RPC_URL = "http://localhost:8545"  # ethereum2
-#START_BLOCK = 22699600   # June 14th 2025
-#END_BLOCK = 23300300  # Sept 5th 2025
-# -- local --
 RPC_URL = config_env.get_RPC_URL()
 START_BLOCK = config_env.get_START_BLOCK()
 END_BLOCK = config_env.get_END_BLOCK()
 BLOCK_BATCH_SIZE = config_env.get_BLOCK_BATCH_SIZE()  # number of blocks to query concurrently
 CHUNK_SIZE = config_env.get_CHUNK_SIZE()  # number of blocks to process before writing to CSV
 
-# DeFi Protocol addresses (main contracts)
-DEFI_PROTOCOLS = {
-    "aave": [
-        "0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9",  # Aave V2 Pool
-        "0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2",  # Aave V3 Pool
-    ],
-    "compound": [
-        "0x39AA39c021dfbaE8faC545936693aC917d5E7563",  # Compound Comptroller
-        # "0xc00e94cb662c3520282e6f5717214004a7f26888",  # Compound Token
-    ],
-    "uniswap": [ # https://docs.uniswap.org/contracts/v3/reference/deployments/ethereum-deployments
-        #  https://docs.uniswap.org/contracts/v2/reference/smart-contracts/v2-deployments
-        # "0x1f98431c8ad98523631ae4a59f267346ea31f984",  # Uniswap V3 Factory
-        "0xE592427A0AEce92De3Edee1F18E0157C05861564",  # Uniswap V3 Router
-        "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",  # Uniswap V2 Router
-    ],
-    "lido": [
-        "0xAE7ab96520DE3A18E5e111B5EaAb095312d7FE84",  # Lido stETH
-        "0xdc24316b9ae028f1497c275eb9192a3ea0f67022",  # Lido stETH Curve Pool
-    ],
-    "curve": [
-        "0xbebc44782c7db0a1a60cb6fe97d0b483032ff1c7",  # Curve 3pool
-        "0xa2b47e3d5c8c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",  # Curve Registry
-    ],
-    "dydx": [
-        "0x1e0447b19bb6ecfdae1e4ae1694b0c3659614e4e",  # dYdX Solo Margin
-        # "0x4ec4ba6e9bb1e416b70419c1a96c319c12f98234",  # dYdX Perpetual
-    ]
-    #"morpho": [
-    #    "0x58D97B57BB95320F9a05dC918Aef65434969c2B2",  # Morpho Protocol
-    #]
-}
+with open("config/stablecoins.yaml", "r") as f:
+    STABLECOINS_CONFIG = yaml.safe_load(f)
+STABLECOINS = STABLECOINS_CONFIG["stablecoins"]
 
-# ROLLUP Protocol addresses
-ROLLUP_PROTOCOLS = {
-    "arbitrum": [  # https://docs.arbitrum.io/build-decentralized-apps/reference/contract-addresses
-        "0x8315177aB297bA92A06054cE80a67Ed4DBd7ed3a",  # Arbitrum One Bridge
-        "0xC1Ebd02f738644983b6C4B2d440b8e77DdE276Bd",  # Arbitrum Nova Bridge
-        "0x0B9857ae2D4A3DBe74ffE1d7DF045bb7F96E4840",  # Arbitrum One Outbox
-        "0xD4B80C3D7240325D18E645B49e6535A3Bf95cc58",  # Arbitrum Nova Outbox
-        "0x912CE59144191C1204E64559FE8253a0e49E6548",  # Arbitrum One Delayed Inbox
-        "0xc4448b71118c9071Bcb9734A0EAc55D18A153949",  # Arbitrum Nova Delayed Inbox
-    ],
-    "base": [  #https://docs.base.org/base-chain/network-information/base-contracts#ethereum-mainnet
-        "0x3154Cf16ccdb4C6d922629664174b904d80F2C35",  # Base Bridge
-    ],
-    "optimism": [  # https://docs.optimism.io/reference/addresses
-        "0x99C9fc46f92E8a1c0deC1b1747d010903E884bE1",  # Optimism Bridge Proxy
-    ],
-    #"polygon": [
-    #    "0x7D1AfA7B718fb893dB30A3aBc0Cfc608AaCfeBB0",  # Polygon Bridge
-    #],
-    "unichain": [  #https://docs.unichain.org/docs/technical-information/contract-addresses
-        "0x81014f44b0a345033bb2b3b21c7a1a308b35feea",  # Unichain Bridge
-    ]
-}
 
-# Stablecoin configurations
-STABLECOINS = {
-    "usdc": {
-        "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".lower(),
-        "decimals": 6,
-        "symbol": "USDC"
-    },
-    "usdt": {
-        "address": "0xdAC17F958D2ee523a2206206994597C13D831ec7".lower(),
-        "decimals": 6,
-        "symbol": "USDT"
-    },
-    "pyusd": {
-        "address": "0x6c3ea9036406852006290770BEdFcAbA0e23A0e8".lower(),
-        "decimals": 6,
-        "symbol": "PYUSD"
-    },
-    # "dai": {
-    #     "address": "0x6B175474E89094C44Da98b954EedeAC495271d0F".lower(),
-    #     "decimals": 18,
-    #     "symbol": "DAI"
-    # },
-    "eurc": {
-        "address": "0x1aBaEA1f7C830bD89Acc67eC4af516284b1bC33c".lower(),
-        "decimals": 6,
-        "symbol": "EURC"
-    }
-}
+# # Stablecoin configurations
+# STABLECOINS = {
+#     "usdc": {
+#         "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".lower(),
+#         "decimals": 6,
+#         "symbol": "USDC"
+#     },
+#     "usdt": {
+#         "address": "0xdAC17F958D2ee523a2206206994597C13D831ec7".lower(),
+#         "decimals": 6,
+#         "symbol": "USDT"
+#     },
+#     "pyusd": {
+#         "address": "0x6c3ea9036406852006290770BEdFcAbA0e23A0e8".lower(),
+#         "decimals": 6,
+#         "symbol": "PYUSD"
+#     },
+#     # "dai": {
+#     #     "address": "0x6B175474E89094C44Da98b954EedeAC495271d0F".lower(),
+#     #     "decimals": 18,
+#     #     "symbol": "DAI"
+#     # },
+#     "eurc": {
+#         "address": "0x1aBaEA1f7C830bD89Acc67eC4af516284b1bC33c".lower(),
+#         "decimals": 6,
+#         "symbol": "EURC"
+#     }
+# }
 
 # ERC20 Transfer event signature:
 # Transfer(address indexed from, address indexed to, uint256 value)
@@ -178,31 +121,6 @@ def write_daily_stats_chunk(daily_data, daily_stats_file, is_first_chunk=False):
             ])
 
 
-def is_defi_protocol(address):
-    """Check if an address belongs to any DeFi protocol"""
-    address_lower = address.lower()
-    
-    # Check DeFi protocols
-    for protocol, addresses in DEFI_PROTOCOLS.items():
-        for protocol_address in addresses:
-            if address_lower == protocol_address.lower():
-                return True
-    
-    return False
-
-
-def is_rollup_protocol(address):
-    """Check if an address belongs to any ROLLUP protocol"""
-    address_lower = address.lower()
-    
-    # Check ROLLUP protocols
-    for protocol, addresses in ROLLUP_PROTOCOLS.items():
-        for protocol_address in addresses:
-            if address_lower == protocol_address.lower():
-                return True
-    
-    return False
-
 
 def is_defi_or_rollup_protocol(address):
     """Check if an address belongs to any DeFi or ROLLUP protocol"""
@@ -236,10 +154,8 @@ def parse_transfer_log(log, tx_hash, block_number, timestamp,
         "from": from_address,
         "to": to_address,
         "amount": amount_tokens,
-        "is_defi_transaction": (is_defi_protocol(from_address) or
-                                is_defi_protocol(to_address)),
-        "is_rollup_transaction": (is_rollup_protocol(from_address) or
-                                  is_rollup_protocol(to_address))
+        "is_defi_transaction": False,
+        "is_rollup_transaction": False,
     }
 
 
@@ -281,7 +197,7 @@ async def process_block(session, block_number, selected_stablecoins):
                 # Find which stablecoin this transfer belongs to
                 for stablecoin_name in selected_stablecoins:
                     stablecoin_config = STABLECOINS[stablecoin_name]
-                    if log_address == stablecoin_config["address"]:
+                    if log_address == stablecoin_config["address"].lower():
                         transfer = parse_transfer_log(
                             log, tx_hash, block_number, timestamp,
                             stablecoin_config
