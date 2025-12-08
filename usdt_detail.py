@@ -67,32 +67,6 @@ def write_csv_chunk(filename, fieldnames, rows, is_first_chunk=False):
             writer.writeheader()
         writer.writerows(rows)
 
-
-def write_daily_stats(daily_stats, filename):
-    fieldnames = [
-        "date",
-        "issued_event",          # Issue(uint256)
-        "redeemed_event",        # Redeem(uint256)
-        "destroyed_blackfunds",  # DestroyedBlackFunds(address,uint256)
-        "from_zero_transfer",    # volume of transfers with from == 0x0
-        "to_zero_transfer",      # volume of transfers with to   == 0x0
-    ]
-    with open(filename, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for date in sorted(daily_stats.keys()):
-            stats = daily_stats[date]
-            writer.writerow(
-                {
-                    "date": date,
-                    "issued_event": f"{stats['issued_event']:.2f}",
-                    "redeemed_event": f"{stats['redeemed_event']:.2f}",
-                    "destroyed_blackfunds": f"{stats['destroyed_blackfunds']:.2f}",
-                    "from_zero_transfer": f"{stats['from_zero_transfer']:.2f}",
-                    "to_zero_transfer": f"{stats['to_zero_transfer']:.2f}",
-                }
-            )
-
 def write_csv_chunk(filename, fieldnames, rows, is_first_chunk=False):
     if not rows:
         return
@@ -142,6 +116,19 @@ def _decode_address_from_topic(topic_hex: str) -> str:
     # topics are 32 bytes, last 20 bytes = address
     return "0x" + topic_hex[-40:]
 
+def _decode_single_uint_from_data(data_hex: str) -> float:
+    """
+    Decode a single uint256 from event data (one 32-byte word).
+    Used for Issue(uint256) and Redeem(uint256).
+    """
+    if data_hex in ("0x", "0x0", None):
+        return 0.0
+
+    data = data_hex[2:]
+    # we only care about the last 32 bytes
+    data = data[-64:]
+    amount_int = int(data, 16)
+    return amount_int / (10 ** USDT_DECIMALS)
 
 def _decode_amount_from_data(data_hex: str) -> float:
     if data_hex == "0x" or data_hex == "0x0":
@@ -156,7 +143,7 @@ def _timestamp_to_date_str(timestamp: int) -> str:
 
 def parse_usdt_transfer_log(log, tx_hash, block_number, timestamp):
     """
-    
+    Transfer events always have to, from and amount.
     """
     topics = log.get("topics", [])
     if len(topics) < 3:
@@ -280,6 +267,30 @@ def parse_usdt_blacklist_log(topic0, log, tx_hash, block_number, timestamp):
         "address": user_address,
         "amount": amount_tokens,
     }
+
+def parse_usdt_issue_redeem_log(topic0, log, tx_hash, block_number, timestamp):
+    """
+    Parse Issue(uint256) and Redeem(uint256) events.
+    These don't carry an address parameter in the event itself.
+    """
+    if topic0 == ISSUE_EVENT_TOPIC:
+        event_type = "issue"
+    elif topic0 == REDEEM_EVENT_TOPIC:
+        event_type = "redeem"
+    else:
+        return None
+
+    amount_tokens = _decode_single_uint_from_data(log["data"])
+
+    return {
+        "block_number": block_number,
+        "timestamp": timestamp,
+        "date": _timestamp_to_date_str(timestamp),
+        "tx_hash": tx_hash,
+        "event_type": event_type,
+        "amount": amount_tokens,
+    }
+
 
 
 # --------------------------------------------------------------------
