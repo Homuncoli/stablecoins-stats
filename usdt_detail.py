@@ -9,6 +9,8 @@ import config_env
 import yaml
 from web3 import Web3
 import os
+import logging
+from logging.handlers import RotatingFileHandler
 
 
 RPC_URL = config_env.get_RPC_URL()
@@ -50,6 +52,35 @@ async def rpc_call(session, method, params=None):
     ) as resp:
         result = await resp.json()
         return result["result"]
+
+
+
+# --------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------
+
+LOG_FILE = "usdt_detail.log"
+
+logger = logging.getLogger("usdt_detail")
+logger.setLevel(logging.INFO)
+
+# File handler (rotating so it doesn't get huge)
+fh = RotatingFileHandler(LOG_FILE, maxBytes=20_000_000, backupCount=3)
+fh.setLevel(logging.INFO)
+
+# Console handler (what you see in screen)
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+
+formatter = logging.Formatter(
+    "%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+fh.setFormatter(formatter)
+ch.setFormatter(formatter)
+
+logger.addHandler(fh)
+logger.addHandler(ch)
 
 
 # --------------------------------------------------------------------
@@ -382,15 +413,15 @@ async def process_block(session, block_number):
 # --------------------------------------------------------------------
 
 async def main():
-    print("=" * 70)
-    print("USDT DETAIL ANALYSIS (Ethereum)")
-    print("=" * 70)
-    print(f"RPC URL:        {RPC_URL}")
-    print(f"USDT address:   {USDT_ADDRESS}")
-    print(f"Block range:    {START_BLOCK} – {END_BLOCK}")
-    print(f"Batch size:     {BLOCK_BATCH_SIZE}")
-    print(f"Chunk size:     {CHUNK_SIZE}")
-    print("=" * 70)
+    logger.info("=" * 70)
+    logger.info("USDT DETAIL ANALYSIS (Ethereum)")
+    logger.info("=" * 70)
+    logger.info(f"RPC URL:        {RPC_URL}")
+    logger.info(f"USDT address:   {USDT_ADDRESS}")
+    logger.info(f"Block range:    {START_BLOCK} – {END_BLOCK}")
+    logger.info(f"Batch size:     {BLOCK_BATCH_SIZE}")
+    logger.info(f"Chunk size:     {CHUNK_SIZE}")
+    logger.info("=" * 70)
 
     transfers_file = "usdt_transfers_detailed.csv"
     blacklist_file = "usdt_blacklist_events.csv"
@@ -461,7 +492,7 @@ async def main():
             chunk_end = min(chunk_start + CHUNK_SIZE - 1, END_BLOCK)
             chunk_count += 1
 
-            print(f"\nProcessing chunk {chunk_count}: blocks {chunk_start}-{chunk_end}")
+            logger.info(f"\nProcessing chunk {chunk_count}: blocks {chunk_start}-{chunk_end}")
 
             chunk_transfers = []
             chunk_blacklist = []
@@ -474,7 +505,13 @@ async def main():
                     process_block(session, b)
                     for b in range(batch_start, batch_end + 1)
                 ]
-                results = await asyncio.gather(*tasks)
+                try:
+                    results = await asyncio.gather(*tasks)
+                except Exception as e:
+                    logger.exception(
+                        f"Error while processing batch {batch_start}-{batch_end}: {e}"
+                    )
+                    continue
                 total_blocks_processed += len(results)
 
                 for transfers, issue_redeem, blacklist in tqdm(
@@ -510,7 +547,7 @@ async def main():
                 )
                 first_transfers_chunk = False
                 total_transfers += len(chunk_transfers)
-                print(f"  ✓ Transfers: {len(chunk_transfers)} rows")
+                logger.info(f"  ✓ Transfers: {len(chunk_transfers)} rows")
 
             if chunk_blacklist:
                 write_csv_chunk(
@@ -521,7 +558,7 @@ async def main():
                 )
                 first_blacklist_chunk = False
                 total_blacklist_events += len(chunk_blacklist)
-                print(f"  ✓ Blacklist events: {len(chunk_blacklist)} rows")
+                logger.info(f"  ✓ Blacklist events: {len(chunk_blacklist)} rows")
 
             if chunk_issue_redeem:
                 write_csv_chunk(
@@ -536,30 +573,30 @@ async def main():
                         total_issues += 1
                     elif e["event_type"] == "redeem":
                         total_redeems += 1
-                print(f"  ✓ Issue/Redeem events: {len(chunk_issue_redeem)} rows")
+                logger.info(f"  ✓ Issue/Redeem events: {len(chunk_issue_redeem)} rows")
 
-            print(f"✓ Chunk {chunk_count} completed.")
+            logger.info(f"✓ Chunk {chunk_count} completed.")
 
     # Write daily stats (from events only)
-    print("\nWriting daily issuance/redemption stats (from events only)…")
+    logger.info("\nWriting daily issuance/redemption stats (from events only)…")
     write_daily_stats(daily_stats, daily_stats_file)
-    print(f"  ✓ Daily stats written to {daily_stats_file}")
+    logger.info(f"  ✓ Daily stats written to {daily_stats_file}")
 
     # Final summary
-    print("\n" + "=" * 70)
-    print("USDT DETAIL SUMMARY")
-    print("=" * 70)
-    print(f"Blocks processed:         {total_blocks_processed}")
-    print(f"Total USDT transfers:     {total_transfers}")
-    print(f"Issue events (Issue):     {total_issues}")
-    print(f"Redeem events (Redeem):   {total_redeems}")
-    print(f"Blacklist events (all):   {total_blacklist_events}")
-    print()
-    print(f"Transfers CSV:            {transfers_file}")
-    print(f"Blacklist events CSV:     {blacklist_file}")
-    print(f"Issue/Redeem CSV:         {issue_redeem_file}")
-    print(f"Daily stats CSV:          {daily_stats_file}")
-    print("\nDone.")
+    logger.info("\n" + "=" * 70)
+    logger.info("USDT DETAIL SUMMARY")
+    logger.info("=" * 70)
+    logger.info(f"Blocks processed:         {total_blocks_processed}")
+    logger.info(f"Total USDT transfers:     {total_transfers}")
+    logger.info(f"Issue events (Issue):     {total_issues}")
+    logger.info(f"Redeem events (Redeem):   {total_redeems}")
+    logger.info(f"Blacklist events (all):   {total_blacklist_events}")
+    
+    logger.info(f"Transfers CSV:            {transfers_file}")
+    logger.info(f"Blacklist events CSV:     {blacklist_file}")
+    logger.info(f"Issue/Redeem CSV:         {issue_redeem_file}")
+    logger.info(f"Daily stats CSV:          {daily_stats_file}")
+    logger.info("\nDone.")
 
 
 if __name__ == "__main__":
