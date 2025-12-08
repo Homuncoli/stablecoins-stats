@@ -2,3 +2,7 @@
 *.png
 *.DS_Store
 *.env
+*.vnv
+*.venv
+__pycache__
+notes.md
