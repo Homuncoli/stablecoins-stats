@@ -441,7 +441,6 @@ def main():
 
             try:
                 logs = rpc.eth_get_logs(chunk_start, chunk_end, selected_addrs)
-                print(logs)
             except Exception as e:
                 print(f"eth_getLogs error {chunk_start}-{chunk_end}: {e}")
                 continue
@@ -502,7 +501,6 @@ def main():
                     base.update(_toggle)
 
                 elif ev_cfg.type in ("addedToBlacklist", "removedFromBlacklist"):
-                    print(log)
                     base.update(parse_blacklist_event(log, ev_cfg.type))
 
                 elif ev_cfg.type == "destroyedBlackFunds":
