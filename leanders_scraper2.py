@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import csv
+from datetime import datetime
 import json
 import os
 import sqlite3
@@ -296,14 +297,39 @@ def parse_single_uint_event(log, coin_cfg, event_type: str):
 
 
 def parse_blacklist_event(log, event_type: str):
-    data = log["data"]
+    """
+    Handles both forms:
+      1) indexed address: topics[1] contains the address, data == "0x"
+      2) non-indexed address: data contains the 32-byte encoded address
+    """
+
+    # Case 1: indexed address parameter -> in topics[1]
+    topics = log.get("topics") or []
+    if len(topics) >= 2 and topics[1] and topics[1].startswith("0x") and len(topics[1]) >= 66:
+        addr = "0x" + topics[1][-40:]
+        return {
+            "event_type": event_type,
+            "address": addr,
+        }
+
+    # Case 2: non-indexed address parameter -> in data
+    data = log.get("data")
+    if not data or data in ("0x", "0x0"):
+        # No usable data and no indexed topic
+        raise ValueError("Blacklist event has no address in topics[1] or data")
+
     if data.startswith("0x"):
         data = data[2:]
+
     if len(data) < 64:
         raise ValueError(f"Blacklist event data too short: {len(data)} hex chars")
+
     addr_word = data[:64]
     addr = "0x" + addr_word[-40:]
-    return {"event_type": event_type, "address": addr}
+    return {
+        "event_type": event_type,
+        "address": addr,
+    }
 
 
 def parse_destroyed_black_funds(log, coin_cfg):
@@ -411,10 +437,11 @@ def main():
     try:
         for chunk_start in range(start_block, end_block + 1, chunk_size):
             chunk_end = min(chunk_start + chunk_size - 1, end_block)
-            print(f"Processing blocks {chunk_start} - {chunk_end}…")
+            print(f"{datetime.now()} Processing blocks {chunk_start} - {chunk_end}…")
 
             try:
                 logs = rpc.eth_get_logs(chunk_start, chunk_end, selected_addrs)
+                print(logs)
             except Exception as e:
                 print(f"eth_getLogs error {chunk_start}-{chunk_end}: {e}")
                 continue
@@ -475,6 +502,7 @@ def main():
                     base.update(_toggle)
 
                 elif ev_cfg.type in ("addedToBlacklist", "removedFromBlacklist"):
+                    print(log)
                     base.update(parse_blacklist_event(log, ev_cfg.type))
 
                 elif ev_cfg.type == "destroyedBlackFunds":
@@ -491,6 +519,7 @@ def main():
 
             # Batch classify transfer endpoints (chunked to avoid 413)
             try:
+                #print(f"[debug] addresses_in_chunk = {len(addresses_in_chunk)}")
                 classifier.classify_many(addresses_in_chunk, batch_size=code_batch_size)
             except RuntimeError as e:
                 print(f"[classify_many] {e}")
