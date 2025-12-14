@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 import csv
 import json
+import os
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from dotenv import load_dotenv
-import os
 
 import requests
 import yaml
@@ -21,13 +22,8 @@ class RpcClient:
 
     def _call(self, method: str, params):
         self._id += 1
-        payload = {
-            "jsonrpc": "2.0",
-            "id": self._id,
-            "method": method,
-            "params": params,
-        }
-        resp = self.session.post(self.url, json=payload)
+        payload = {"jsonrpc": "2.0", "id": self._id, "method": method, "params": params}
+        resp = self.session.post(self.url, json=payload, timeout=60)
         resp.raise_for_status()
         data = resp.json()
         if "error" in data:
@@ -49,85 +45,156 @@ class RpcClient:
         return self._call("eth_getCode", [address, "latest"])
 
 
+# ---------------- ADDRESS CACHE (SQLite) ---------------- #
+
+class AddressTypeCache:
+    """
+    SQLite-backed cache for address types: "eoa" / "contract".
+    Avoids huge JSON files and avoids loading everything into RAM.
+    """
+
+    def __init__(self, db_path: str = "address_types.sqlite"):
+        self.db_path = db_path
+        self.conn = sqlite3.connect(self.db_path)
+        self._init_db()
+
+    def _init_db(self):
+        cur = self.conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS address_types (
+                address TEXT PRIMARY KEY,
+                addr_type TEXT NOT NULL
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_addr_type ON address_types(addr_type)")
+        self.conn.commit()
+
+    def get_many(self, addresses):
+        """
+        Returns dict: checksum_address -> addr_type for all found in DB.
+        """
+        if not addresses:
+            return {}
+        # SQLite has a parameter limit, chunk the query
+        out = {}
+        addr_list = list(addresses)
+        CHUNK = 800  # safe
+        cur = self.conn.cursor()
+        for i in range(0, len(addr_list), CHUNK):
+            chunk = addr_list[i:i + CHUNK]
+            placeholders = ",".join(["?"] * len(chunk))
+            cur.execute(f"SELECT address, addr_type FROM address_types WHERE address IN ({placeholders})", chunk)
+            out.update({row[0]: row[1] for row in cur.fetchall()})
+        return out
+
+    def set_many(self, mapping: dict):
+        """
+        mapping: checksum_address -> "eoa"/"contract"
+        """
+        if not mapping:
+            return
+        cur = self.conn.cursor()
+        cur.executemany(
+            "INSERT OR REPLACE INTO address_types(address, addr_type) VALUES (?, ?)",
+            [(a, t) for a, t in mapping.items()]
+        )
+        self.conn.commit()
+
+    def close(self):
+        try:
+            self.conn.commit()
+        finally:
+            self.conn.close()
+
+
 # ---------------- ADDRESS CLASSIFIER (EOA vs CONTRACT) ---------------- #
 
 class AddressClassifier:
-    def __init__(self, rpc: RpcClient, cache_path: str = "address_types.json"):
+    def __init__(self, rpc: RpcClient, cache_db_path: str = "address_types.sqlite"):
         self.rpc = rpc
-        self.cache_path = Path(cache_path)
-        if self.cache_path.exists():
-            with self.cache_path.open() as f:
-                self.cache = json.load(f)
-        else:
-            self.cache = {}  # addr -> "eoa" / "contract"
+        self.cache_db = AddressTypeCache(cache_db_path)
 
-    def classify(self, address: str) -> str:
-        """Single-address classification (fallback / rarely used)."""
-        if not address:
-            return "unknown"
-        addr = to_checksum_address(address)
-        if addr in self.cache:
-            return self.cache[addr]
-        code = self.rpc.eth_get_code(addr)
-        addr_type = "contract" if code and code != "0x" else "eoa"
-        self.cache[addr] = addr_type
-        return addr_type
+    def close(self):
+        self.cache_db.close()
 
-    def classify_many(self, addresses) -> None:
+    def classify_many(self, addresses, batch_size: int = 250):
         """
-        Classify a set/list of addresses using a single JSON-RPC batch call.
-        Populates self.cache in-place. Addresses already in cache are skipped.
+        Classify addresses via eth_getCode using JSON-RPC batch calls,
+        split into smaller batches to avoid HTTP 413 (request too large).
+
+        Steps:
+        1) Normalize & checksum addresses
+        2) Query SQLite cache for known ones
+        3) Batch-call eth_getCode only for unknown ones
+        4) Write results back to SQLite
         """
+        # Normalize + checksum + dedupe
         normalized = []
+        seen = set()
         for a in addresses:
             if not a:
                 continue
             try:
-                normalized.append(to_checksum_address(a))
+                addr = to_checksum_address(a)
             except Exception:
                 continue
+            if addr in seen:
+                continue
+            seen.add(addr)
+            normalized.append(addr)
 
-        to_query = [a for a in normalized if a not in self.cache]
+        if not normalized:
+            return
+
+        # Check cache first
+        cached = self.cache_db.get_many(normalized)
+        to_query = [a for a in normalized if a not in cached]
         if not to_query:
             return
 
-        payload = []
-        for i, addr in enumerate(to_query):
-            payload.append({
-                "jsonrpc": "2.0",
-                "id": i,
-                "method": "eth_getCode",
-                "params": [addr, "latest"],
-            })
+        newly_classified = {}
 
-        resp = self.rpc.session.post(self.rpc.url, json=payload)
-        resp.raise_for_status()
-        results = resp.json()
+        # Send multiple smaller batches to avoid 413
+        for start in range(0, len(to_query), batch_size):
+            chunk = to_query[start:start + batch_size]
 
-        code_by_id = {}
-        for item in results:
-            if "error" in item:
-                code_by_id[item["id"]] = "0x"
-            else:
-                code_by_id[item["id"]] = item.get("result", "0x")
+            payload = [
+                {"jsonrpc": "2.0", "id": i, "method": "eth_getCode", "params": [addr, "latest"]}
+                for i, addr in enumerate(chunk)
+            ]
 
-        for i, addr in enumerate(to_query):
-            code = code_by_id.get(i, "0x")
-            addr_type = "contract" if code and code != "0x" else "eoa"
-            self.cache[addr] = addr_type
+            resp = self.rpc.session.post(self.rpc.url, json=payload, timeout=60)
+            # If still too big, reduce batch_size
+            if resp.status_code == 413:
+                raise RuntimeError(
+                    f"HTTP 413 (Request Entity Too Large) even with batch_size={batch_size}. "
+                    f"Try batch_size=150 or 100."
+                )
+            resp.raise_for_status()
+            results = resp.json()
 
-    def save(self):
-        with self.cache_path.open("w") as f:
-            json.dump(self.cache, f)
+            code_by_id = {}
+            for item in results:
+                if "error" in item:
+                    code_by_id[item["id"]] = "0x"
+                else:
+                    code_by_id[item["id"]] = item.get("result", "0x")
+
+            for i, addr in enumerate(chunk):
+                code = code_by_id.get(i, "0x")
+                newly_classified[addr] = "contract" if code and code != "0x" else "eoa"
+
+        # Persist to SQLite
+        self.cache_db.set_many(newly_classified)
 
 
 # ---------------- CONFIG / EVENT MAPPING ---------------- #
 
 @dataclass
 class EventConfig:
-    name: str        # yaml key: "transfer", "mint", ...
-    type: str        # semantic type: "transfer", "issue", "redeem", ...
-    topic0: str      # keccak hash of signature
+    name: str
+    type: str
+    topic0: str
     signature: str
 
 
@@ -135,9 +202,6 @@ ZERO_ADDR = "0x0000000000000000000000000000000000000000"
 
 
 def load_env_config(coin_keys):
-    """
-    Load scraper configuration from .env file.
-    """
     load_dotenv()
 
     cfg = {}
@@ -146,22 +210,14 @@ def load_env_config(coin_keys):
     cfg["end_block"] = int(os.getenv("END_BLOCK"))
     cfg["chunk_size"] = int(os.getenv("CHUNK_SIZE", 5000))
 
-    # COINS=usdt,dai,usdc
     coin_env = os.getenv("COINS", "")
-    if coin_env:
-        cfg["coin_keys"] = [c.strip() for c in coin_env.split(",")]
-    else:
-        cfg["coin_keys"] = coin_keys
+    cfg["coin_keys"] = [c.strip() for c in coin_env.split(",")] if coin_env else coin_keys
 
-    # EVENTS=transfers,issuance,blacklist
     event_env = os.getenv("EVENTS", "")
-    if event_env:
-        cfg["categories"] = {e.strip() for e in event_env.split(",")}
-    else:
-        cfg["categories"] = {"transfers", "issuance", "blacklist"}
+    cfg["categories"] = {e.strip() for e in event_env.split(",")} if event_env else {"transfers", "issuance", "blacklist"}
 
-    # Optional: output root folder
     cfg["out_root"] = os.getenv("OUT_ROOT", "out")
+    cfg["code_batch_size"] = int(os.getenv("CODE_BATCH_SIZE", "250"))  # new knob
 
     return cfg
 
@@ -170,8 +226,8 @@ def load_stablecoins_config(path: str):
     with open(path) as f:
         cfg = yaml.safe_load(f)["stablecoins"]
 
-    stablecoins_by_addr = {}   # checksum address -> coin_cfg
-    coins_meta = {}            # key -> meta info (symbol, etc.)
+    stablecoins_by_addr = {}
+    coins_meta = {}
 
     for key, info in cfg.items():
         addr = to_checksum_address(info["address"])
@@ -203,11 +259,7 @@ def load_stablecoins_config(path: str):
             "events": events_by_topic,
             "mint_burn_via_zero": mint_burn_via_zero,
         }
-        coins_meta[key] = {
-            "address": addr,
-            "symbol": symbol,
-            "decimals": decimals,
-        }
+        coins_meta[key] = {"address": addr, "symbol": symbol, "decimals": decimals}
 
     return stablecoins_by_addr, coins_meta
 
@@ -219,7 +271,7 @@ def parse_transfer_log(log, coin_cfg):
     data = log["data"]
 
     from_addr = "0x" + topics[1][-40:]
-    to_addr   = "0x" + topics[2][-40:]
+    to_addr = "0x" + topics[2][-40:]
 
     value_raw = int(data, 16)
     amount = value_raw / (10 ** coin_cfg["decimals"])
@@ -234,61 +286,41 @@ def parse_transfer_log(log, coin_cfg):
     else:
         event_type = "transfer"
 
-    return {
-        "event_type": event_type,
-        "from": from_addr,
-        "to": to_addr,
-        "amount": amount,
-    }
+    return {"event_type": event_type, "from": from_addr, "to": to_addr, "amount": amount}
 
 
 def parse_single_uint_event(log, coin_cfg, event_type: str):
-    data = log["data"]
-    value_raw = int(data, 16)
+    value_raw = int(log["data"], 16)
     amount = value_raw / (10 ** coin_cfg["decimals"])
-    return {
-        "event_type": event_type,
-        "amount": amount,
-    }
+    return {"event_type": event_type, "amount": amount}
 
 
 def parse_blacklist_event(log, event_type: str):
     data = log["data"]
     if data.startswith("0x"):
         data = data[2:]
-
     if len(data) < 64:
         raise ValueError(f"Blacklist event data too short: {len(data)} hex chars")
-
     addr_word = data[:64]
     addr = "0x" + addr_word[-40:]
-
-    return {
-        "event_type": event_type,
-        "address": addr,
-    }
+    return {"event_type": event_type, "address": addr}
 
 
 def parse_destroyed_black_funds(log, coin_cfg):
     data = log["data"]
     if data.startswith("0x"):
         data = data[2:]
-
     if len(data) < 128:
         raise ValueError(f"DestroyedBlackFunds data too short: {len(data)} hex chars")
 
-    addr_word   = data[:64]
+    addr_word = data[:64]
     amount_word = data[64:128]
 
     addr = "0x" + addr_word[-40:]
     value_raw = int(amount_word, 16)
     amount = value_raw / (10 ** coin_cfg["decimals"])
 
-    return {
-        "event_type": "destroyedBlackFunds",
-        "address": addr,
-        "amount": amount,
-    }
+    return {"event_type": "destroyedBlackFunds", "address": addr, "amount": amount}
 
 
 def event_category(event_type: str) -> str:
@@ -303,10 +335,12 @@ def event_category(event_type: str) -> str:
 
 # ---------------- MAIN SCRAPER ---------------- #
 
+
+
 def main():
+    
     stablecoins_by_addr, coins_meta = load_stablecoins_config("config/stablecoins_detailed.yaml")
     coin_keys = list(coins_meta.keys())
-
     env = load_env_config(coin_keys)
 
     rpc_url = env["rpc_url"]
@@ -316,17 +350,19 @@ def main():
     selected_coin_keys = env["coin_keys"]
     selected_categories = env["categories"]
     out_root = Path(env["out_root"])
+    code_batch_size = env["code_batch_size"]
 
     print("=== Loaded .env configuration ===")
     print(f"RPC URL: {rpc_url}")
-    print(f"Blocks: {start_block} → {end_block}")
+    print(f"Blocks: {start_block} - {end_block}")
     print(f"Chunk size: {chunk_size}")
     print(f"Stablecoins: {selected_coin_keys}")
     print(f"Event categories: {selected_categories}")
     print(f"Output root: {out_root.resolve()}")
+    print(f"CODE_BATCH_SIZE: {code_batch_size}")
 
     rpc = RpcClient(rpc_url)
-    classifier = AddressClassifier(rpc)
+    classifier = AddressClassifier(rpc, cache_db_path="address_types.sqlite")
 
     # Build mapping for selected coins
     addr_to_coin = {}
@@ -338,27 +374,10 @@ def main():
         addr_to_coin[addr] = coin_cfg
         selected_addrs.append(addr)
 
-    # ---------------- OUTPUT: per-coin dir + per-category CSVs ---------------- #
-
-    TRANSFER_FIELDS = [
-        "block_number", "timestamp", "tx_hash",
-        "event_type",
-        "from", "to", "from_type", "to_type",
-        "amount",
-    ]
-
-    ISSUANCE_FIELDS = [
-        "block_number", "timestamp", "tx_hash",
-        "event_type",
-        "amount",
-    ]
-
-    BLACKLIST_FIELDS = [
-        "block_number", "timestamp", "tx_hash",
-        "event_type",
-        "address",
-        "amount",   # only for destroyedBlackFunds; blank otherwise
-    ]
+    # Output CSVs: out/<symbol>/transfers.csv etc.
+    TRANSFER_FIELDS = ["block_number", "timestamp", "tx_hash", "event_type", "from", "to", "from_type", "to_type", "amount"]
+    ISSUANCE_FIELDS = ["block_number", "timestamp", "tx_hash", "event_type", "amount"]
+    BLACKLIST_FIELDS = ["block_number", "timestamp", "tx_hash", "event_type", "address", "amount"]
 
     def _open_writer(path: Path, fieldnames):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -367,13 +386,11 @@ def main():
         w.writeheader()
         return f, w
 
-    out_files = {}   # coin_key -> {category -> filehandle}
-    writers = {}     # coin_key -> {category -> DictWriter}
-
+    out_files = {}
+    writers = {}
     for key in selected_coin_keys:
         symbol = coins_meta[key]["symbol"]
         coin_dir = out_root / symbol.lower()
-
         out_files[key] = {}
         writers[key] = {}
 
@@ -389,7 +406,6 @@ def main():
         out_files[key]["blacklist"] = f
         writers[key]["blacklist"] = w
 
-    # Cache block timestamps to reduce RPC calls
     block_ts_cache = {}
 
     try:
@@ -449,23 +465,20 @@ def main():
                 if ev_cfg.type == "transfer":
                     parsed = parse_transfer_log(log, coin_cfg)
                     base.update(parsed)
-
                     if parsed.get("from"):
                         addresses_in_chunk.add(parsed["from"])
                     if parsed.get("to"):
                         addresses_in_chunk.add(parsed["to"])
 
                 elif ev_cfg.type in ("issue", "redeem", "mint", "burn"):
-                    parsed = parse_single_uint_event(log, coin_cfg, ev_cfg.type)
-                    base.update(parsed)
+                    _toggle = parse_single_uint_event(log, coin_cfg, ev_cfg.type)
+                    base.update(_toggle)
 
                 elif ev_cfg.type in ("addedToBlacklist", "removedFromBlacklist"):
-                    parsed = parse_blacklist_event(log, ev_cfg.type)
-                    base.update(parsed)
+                    base.update(parse_blacklist_event(log, ev_cfg.type))
 
                 elif ev_cfg.type == "destroyedBlackFunds":
-                    parsed = parse_destroyed_black_funds(log, coin_cfg)
-                    base.update(parsed)
+                    base.update(parse_destroyed_black_funds(log, coin_cfg))
 
                 else:
                     continue
@@ -474,28 +487,34 @@ def main():
                 if cat not in selected_categories:
                     continue
 
-                coin_key = coin_cfg["key"]
-                rows_by_coin_key[coin_key].append(base)
+                rows_by_coin_key[coin_cfg["key"]].append(base)
 
-            # Batch classify only transfer endpoints
-            classifier.classify_many(addresses_in_chunk)
+            # Batch classify transfer endpoints (chunked to avoid 413)
+            try:
+                classifier.classify_many(addresses_in_chunk, batch_size=code_batch_size)
+            except RuntimeError as e:
+                print(f"[classify_many] {e}")
+                print("Tip: set CODE_BATCH_SIZE=150 (or 100) in your .env and rerun.")
+                raise
 
-            # Write rows into the correct per-coin / per-category CSV
+            # Write rows to per-category files
             for coin_key, rows in rows_by_coin_key.items():
                 for r in rows:
                     cat = event_category(r["event_type"])
-                    if cat not in selected_categories:
-                        continue
-
                     if cat == "transfers":
+                        # Lookup types from SQLite cache (should now be present)
                         if r.get("from"):
                             try:
-                                r["from_type"] = classifier.cache.get(to_checksum_address(r["from"]))
+                                r["from_type"] = classifier.cache_db.get_many([to_checksum_address(r["from"])]).get(
+                                    to_checksum_address(r["from"])
+                                )
                             except Exception:
                                 r["from_type"] = None
                         if r.get("to"):
                             try:
-                                r["to_type"] = classifier.cache.get(to_checksum_address(r["to"]))
+                                r["to_type"] = classifier.cache_db.get_many([to_checksum_address(r["to"])]).get(
+                                    to_checksum_address(r["to"])
+                                )
                             except Exception:
                                 r["to_type"] = None
 
@@ -507,13 +526,11 @@ def main():
                     elif cat == "blacklist":
                         writers[coin_key]["blacklist"].writerow({k: r.get(k) for k in BLACKLIST_FIELDS})
 
-            classifier.save()
-
     finally:
         for coin_key in out_files:
             for f in out_files[coin_key].values():
                 f.close()
-        classifier.save()
+        classifier.close()
 
 
 if __name__ == "__main__":
