@@ -1,0 +1,126 @@
+stablecoins:
+  usdt:
+    address: "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+    symbol: "USDT"
+    decimals: 6
+    events:
+      transfer:
+        signature: "Transfer(address,address,uint256)"
+        type: "transfer"
+      mint:
+        signature: "Issue(uint256)"
+        type: "issue"
+      burn:
+        signature: "Redeem(uint256)"
+        type: "redeem"
+      addedToBlacklist:
+        signature: "AddedBlackList(address)"
+        type: "addedToBlacklist"
+      removedFromBlacklist:
+        signature: "RemovedBlackList(address)"
+        type: "removedFromBlacklist"
+      destroyedBlackFunds:
+        signature: "DestroyedBlackFunds(address,uint256)"
+        type: "destroyedBlackFunds"
+      mint_burn_via_zero:
+        enabled: false
+
+  usdc:
+    address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+    symbol: "USDC"
+    decimals: 6
+    events:
+      transfer:
+        signature: "Transfer(address,address,uint256)"
+        type: "transfer"
+      mint:
+        signature: "Mint(address,address,uint256)"
+        type: "issue"
+      burn:
+        signature: "Burn(address,uint256)"
+        type: "redeem"
+      addedToBlacklist:
+        signature: "Blacklisted(address)"
+        type: "addedToBlacklist"
+      removedFromBlacklist:
+        signature: "UnBlacklisted(address)"
+        type: "removedFromBlacklist"
+      mint_burn_via_zero:
+        enabled: false
+
+  eurc:
+    address: "0x1aBaEA1f7C830bD89Acc67eC4af516284b1bC33c"
+    symbol: "EURC"
+    decimals: 6
+    events:
+      transfer:
+        signature: "Transfer(address,address,uint256)"
+        type: "transfer"
+      mint:
+        signature: "Mint(address,address,uint256)"
+        type: "issue"
+      burn:
+        signature: "Burn(address,uint256)"
+        type: "redeem"
+      addedToBlacklist:
+        signature: "Blacklisted(address)"
+        type: "addedToBlacklist"
+      removedFromBlacklist:
+        signature: "UnBlacklisted(address)"
+        type: "removedFromBlacklist"
+      mint_burn_via_zero:
+        enabled: false
+
+  dai:
+    address: "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+    symbol: "DAI"
+    decimals: 18
+    events:
+      transfer:
+        signature: "Transfer(address,address,uint256)"
+        type: "transfer"
+      mint_burn_via_zero:
+        enabled: true
+
+  frax:
+    address: "0x853d955aCEf822Db058eb8505911ED77F175b99e"
+    symbol: "FRAX"
+    decimals: 18
+    events:
+      transfer:
+        signature: "Transfer(address,address,uint256)"
+        type: "transfer"
+      mint:
+        signature: "FRAXMinted(address,address,uint256)"
+        type: "issue"
+      burn:
+        signature: "FRAXBurned(address,address,uint256)"
+        type: "redeem"
+      mint_burn_via_zero:
+        enabled: false 
+
+  eurt:
+    address: "0xC581b735A1688071A1746c968e0798D642EDE491"
+    symbol: "EURT"
+    decimals: 6
+    events:
+      transfer:
+        signature: "Transfer(address,address,uint256)"
+        type: "transfer"
+      mint:
+        signature: "Issue(uint256)"
+        type: "issue"
+      burn:
+        signature: "Redeem(uint256)"
+        type: "redeem"
+      addedToBlacklist:
+        signature: "AddedBlackList(address)"
+        type: "addedToBlacklist"
+      removedFromBlacklist:
+        signature: "RemovedBlackList(address)"
+        type: "removedFromBlacklist"
+      destroyedBlackFunds:
+        signature: "DestroyedBlackFunds(address,uint256)"
+        type: "destroyedBlackFunds"
+      mint_burn_via_zero:
+        enabled: false
