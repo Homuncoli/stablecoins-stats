@@ -411,7 +411,7 @@ def main():
     try:
         for chunk_start in range(start_block, end_block + 1, chunk_size):
             chunk_end = min(chunk_start + chunk_size - 1, end_block)
-            print(f"Processing blocks {chunk_start}–{chunk_end}…")
+            print(f"Processing blocks {chunk_start} - {chunk_end}…")
 
             try:
                 logs = rpc.eth_get_logs(chunk_start, chunk_end, selected_addrs)
