@@ -30,7 +30,7 @@ BLACKLIST_SIGS = [
     ("UNBLACKLIST", "RemovedBlackList(address)"),
     ("DESTROYEDBLACKFUNDS", "DestroyedBlackFunds(address,uint256)"),
 ]
-EVENT_TYPE = {"BLACKLIST": 1, "UNBLACKLIST": 2}
+EVENT_TYPE = {"BLACKLIST": 1, "UNBLACKLIST": 2, "DESTROYEDBLACKFUNDS": 3}
 BLACKLIST_TOPIC0_TO_TYPE: Dict[str, int] = {
     Web3.keccak(text=sig).hex(): EVENT_TYPE[name] for name, sig in BLACKLIST_SIGS
 }
