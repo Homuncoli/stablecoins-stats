@@ -41,6 +41,9 @@ import psycopg
 from psycopg.rows import dict_row
 import yaml
 from eth_utils import keccak, to_checksum_address
+from dotenv import load_dotenv
+load_dotenv()  # loads .env from current working directory
+
 
 # ---------------- Constants ---------------- #
 
