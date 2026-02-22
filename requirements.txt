@@ -24,6 +24,8 @@ numpy==2.3.4
 pandas==2.3.3
 parsimonious==0.10.0
 propcache==0.4.1
+psycopg==3.3.3
+pyarrow==23.0.1
 pycryptodome==3.23.0
 pydantic==2.12.4
 pydantic_core==2.41.5
