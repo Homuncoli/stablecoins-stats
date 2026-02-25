@@ -16,6 +16,7 @@ Usage:
 """
 
 import os
+from pydoc_data.topics import topics
 import time
 import argparse
 from typing import Any, Dict, List, Optional, Tuple
@@ -150,11 +151,15 @@ def uint256_from_data(data_hex: str, word_index: int = 0) -> int:
 def topic0(sig: str) -> str:
     return "0x" + keccak(text=sig).hex()
 
-
 def safe_int_hex(x):
     if x is None:
         return None
     return int(x, 16) if isinstance(x, str) and x.startswith("0x") else int(x)
+
+def hex_to_int_default0(x: Optional[str]) -> int:
+    if not x or x == "0x":
+        return 0
+    return int(x, 16)
 
 
 
@@ -342,11 +347,13 @@ def insert_transfer_logs(conn: psycopg.Connection, logs: List[dict]) -> None:
         token = hex_to_bytes20(lg["address"])
 
         topics = lg["topics"]
+        if len(topics) < 3:
+            continue  # malformed log
         # Transfer indexed params are always topics[1], topics[2]
         from_addr = topic_to_addr(topics[1])
         to_addr = topic_to_addr(topics[2])
 
-        amount = int(lg.get("data") or "0x0", 16)
+        amount = hex_to_int_default0(lg.get("data"))
         rows.append((bn, txi, logi, token, from_addr, to_addr, amount))
 
     if not rows:
