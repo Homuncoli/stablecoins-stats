@@ -582,6 +582,33 @@ def insert_token_events(conn: psycopg.Connection, rows_raw: List[Tuple[int,int,i
     conn.commit()
 
 
+def fetch_blocks_adaptive(rpc, block_nums, full_tx, start_batch):
+    """Fetch blocks with adaptive batch size to avoid "response too large" errors."""
+    out = []
+    i = 0
+    batch = max(1, start_batch)
+    max_batch = batch
+
+    while i < len(block_nums):
+        chunk = block_nums[i:i + batch]
+        try:
+            out.extend(rpc.eth_get_block_by_number_batch(chunk, full_tx=full_tx))
+            i += batch
+
+            # grow again after success, up to start_batch
+            if batch < max_batch:
+                batch = min(max_batch, batch * 2)
+
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "response too large" in msg and batch > 1:
+                batch = max(1, batch // 2)
+                continue
+            raise
+
+    return out   
+
+
 # ---------------- main ---------------- #
 
 def main():
@@ -627,11 +654,9 @@ def main():
 
             # 1) Blocks + TXs (batched eth_getBlockByNumber with full tx objects)
             block_nums = list(range(chunk_start, chunk_end + 1))
-            for i in range(0, len(block_nums), args.block_batch):
-                batch_nums = block_nums[i:i + args.block_batch]
-                blocks = rpc.eth_get_block_by_number_batch(batch_nums, full_tx=True)
-                insert_blocks_and_txs(conn, blocks)
-
+            blocks = fetch_blocks_adaptive(rpc, block_nums, full_tx=True, start_batch=args.block_batch)
+            insert_blocks_and_txs(conn, blocks)
+            
             # 2) ALL ERC20 Transfer logs in range
             try:
                 transfer_logs = rpc.eth_get_logs(chunk_start, chunk_end, [TRANSFER_TOPIC0])
