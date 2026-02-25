@@ -234,7 +234,7 @@ CREATE TABLE IF NOT EXISTS eth_block (
   ts             TIMESTAMPTZ NOT NULL
 );
 
-CREATE TABLE address (
+CREATE TABLE IF NOT EXISTS address (
     id      SERIAL PRIMARY KEY,
     addr    BYTEA UNIQUE NOT NULL
 );
