@@ -19,7 +19,7 @@ import os
 from pydoc_data.topics import topics
 import time
 import argparse
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
 
 import requests
 import psycopg
@@ -244,26 +244,27 @@ CREATE TABLE IF NOT EXISTS address (
     addr    BYTEA UNIQUE NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS token (
+  id   SERIAL PRIMARY KEY,
+  addr BYTEA UNIQUE NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS eth_tx (
-  block_number   INTEGER NOT NULL,
+  block_number   INTEGER NOT NULL REFERENCES eth_block(block_number)
   tx_index       INTEGER NOT NULL,
-  from_addr      BYTEA NOT NULL,
-  to_addr        BYTEA,
+  from_id        INTEGER NOT NULL REFERENCES address(id),
+  to_id          INTEGER REFERENCES address(id),
   method_id      BYTEA,
-  gas_price_wei  NUMERIC(78,0),   -- legacy txs
-  max_fee_per_gas_wei NUMERIC(78,0),          -- EIP-1559
-  max_priority_fee_per_gas_wei NUMERIC(78,0), -- EIP-1559
   PRIMARY KEY (block_number, tx_index),
-  FOREIGN KEY (block_number) REFERENCES eth_block(block_number)
 );
 
 CREATE TABLE IF NOT EXISTS erc20_transfer (
   block_number   INTEGER NOT NULL,
   tx_index       INTEGER NOT NULL,
   log_index      INTEGER NOT NULL,
-  token_addr     BYTEA NOT NULL,
-  from_addr      BYTEA NOT NULL,
-  to_addr        BYTEA NOT NULL,
+  token_id       INTEGER NOT NULL REFERENCES token(id),
+  from_id        INTEGER NOT NULL REFERENCES address(id),
+  to_id          INTEGER NOT NULL REFERENCES address(id),
   amount         NUMERIC(78,0) NOT NULL,
   PRIMARY KEY (block_number, tx_index, log_index),
   FOREIGN KEY (block_number, tx_index) REFERENCES eth_tx(block_number, tx_index)
@@ -273,10 +274,10 @@ CREATE TABLE IF NOT EXISTS token_event (
   block_number   INTEGER NOT NULL,
   tx_index       INTEGER NOT NULL,
   log_index      INTEGER NOT NULL,
-  token_addr     BYTEA NOT NULL,
+  token_id       INTEGER NOT NULL REFERENCES token(id),
   event_type     SMALLINT NOT NULL,
-  a0             BYTEA,
-  a1             BYTEA,
+  a0             INTEGER REFERENCES address(id), 
+  a1             INTEGER REFERENCES address(id), 
   value          NUMERIC(78,0),
   PRIMARY KEY (block_number, tx_index, log_index),
   FOREIGN KEY (block_number, tx_index) REFERENCES eth_tx(block_number, tx_index)
@@ -289,11 +290,63 @@ def ensure_schema(conn: psycopg.Connection) -> None:
     conn.commit()
 
 
+# ---------------- upserts ---------------- #
+
+
+def upsert_addresses(conn: psycopg.Connection, addrs: Iterable[Optional[bytes]]) -> Dict[bytes, int]:
+    """
+    Takes iterable of 20-byte addresses (bytes). Returns mapping bytes->id.
+    Skips None.
+    """
+    addr_set: Set[bytes] = {a for a in addrs if a is not None}
+    if not addr_set:
+        return {}
+
+    addr_list = list(addr_set)
+
+    with conn.cursor() as cur:
+        cur.executemany(
+            "INSERT INTO address(addr) VALUES (%s) ON CONFLICT (addr) DO NOTHING",
+            [(a,) for a in addr_list],
+        )
+        cur.execute(
+            "SELECT id, addr FROM address WHERE addr = ANY(%s)",
+            (addr_list,),
+        )
+        rows = cur.fetchall()
+
+    # Commit once for both insert + select stability
+    conn.commit()
+    return {addr: _id for (_id, addr) in rows}
+
+def upsert_tokens(conn: psycopg.Connection, addrs: Iterable[Optional[bytes]]) -> Dict[bytes, int]:
+    token_set = {a for a in addrs if a is not None}
+    if not token_set:
+        return {}
+    token_list = list(token_set)
+
+    with conn.cursor() as cur:
+        cur.executemany(
+            "INSERT INTO token(addr) VALUES (%s) ON CONFLICT (addr) DO NOTHING",
+            [(a,) for a in token_list],
+        )
+        cur.execute(
+            "SELECT id, addr FROM token WHERE addr = ANY(%s)",
+            (token_list,),
+        )
+        rows = cur.fetchall()
+
+    conn.commit()
+    return {addr: _id for (_id, addr) in rows}
+
+
 # ---------------- inserts ---------------- #
 
 def insert_blocks_and_txs(conn, blocks):
-    block_rows = []
-    tx_rows = []
+    block_rows: List[Tuple[int, int]] = []
+    tx_tmp: List[Tuple[int, int, bytes, Optional[bytes], Optional[bytes]]] = []
+    addr_need: List[Optional[bytes]] = []
+
 
     for b in blocks:
         if not b:
@@ -308,11 +361,19 @@ def insert_blocks_and_txs(conn, blocks):
             to_addr = hex_to_bytes20(tx["to"]) if tx.get("to") else None
             method_id = method_id_from_input(tx.get("input"), to_addr)
 
-            gas_price = safe_int_hex(tx.get("gasPrice"))
-            max_fee = safe_int_hex(tx.get("maxFeePerGas"))
-            max_prio = safe_int_hex(tx.get("maxPriorityFeePerGas"))
+            # gas_price = safe_int_hex(tx.get("gasPrice"))
+            # max_fee = safe_int_hex(tx.get("maxFeePerGas"))
+            # max_prio = safe_int_hex(tx.get("maxPriorityFeePerGas"))
 
-            tx_rows.append((bn, tx_index, from_addr, to_addr, method_id, gas_price, max_fee, max_prio))
+            tx_tmp.append((bn, tx_index, from_addr, to_addr, method_id))
+            addr_need.append([from_addr, to_addr])
+    addr_id = upsert_addresses(conn, addr_need)
+
+    tx_rows: List[Tuple[int, int, int, Optional[int], Optional[bytes]]] = []
+    for bn, tx_index, from_addr, to_addr, method_id in tx_tmp:
+        from_id = addr_id[from_addr]
+        to_id = addr_id[to_addr] if to_addr is not None else None
+        tx_rows.append((bn, tx_index, from_id, to_id, method_id))
 
     with conn.cursor() as cur:
         if block_rows:
@@ -328,10 +389,8 @@ def insert_blocks_and_txs(conn, blocks):
             cur.executemany(
                 """
                 INSERT INTO eth_tx(
-                  block_number, tx_index, from_addr, to_addr, method_id,
-                  gas_price_wei, max_fee_per_gas_wei, max_priority_fee_per_gas_wei
-                )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                  block_number, tx_index, from_addr, to_addr, method_id)
+                VALUES (%s,%s,%s,%s,%s)
                 ON CONFLICT (block_number, tx_index) DO NOTHING
                 """,
                 tx_rows,
@@ -339,31 +398,49 @@ def insert_blocks_and_txs(conn, blocks):
     conn.commit()
 
 def insert_transfer_logs(conn: psycopg.Connection, logs: List[dict]) -> None:
-    rows: List[Tuple[int, int, int, bytes, bytes, bytes, int]] = []
+    parsed: List[Tuple[int,int,int,bytes,bytes,bytes,int]] = []
+    token_need: List[Optional[bytes]] = []
+    addr_need: List[Optional[bytes]] = []
+
     for lg in logs:
+        topics = lg.get("topics") or []
+        if len(topics) < 3:
+            continue
+
         bn = h2i(lg["blockNumber"])
         txi = h2i(lg["transactionIndex"])
         logi = h2i(lg["logIndex"])
-        token = hex_to_bytes20(lg["address"])
 
-        topics = lg["topics"]
-        if len(topics) < 3:
-            continue  # malformed log
-        # Transfer indexed params are always topics[1], topics[2]
+        token_addr = hex_to_bytes20(lg["address"])
         from_addr = topic_to_addr(topics[1])
         to_addr = topic_to_addr(topics[2])
-
         amount = hex_to_int_default0(lg.get("data"))
-        rows.append((bn, txi, logi, token, from_addr, to_addr, amount))
 
-    if not rows:
+        parsed.append((bn, txi, logi, token_addr, from_addr, to_addr, amount))
+        token_need.append(token_addr)
+        addr_need.extend([from_addr, to_addr])
+
+    if not parsed:
         return
+
+    token_id = upsert_tokens(conn, token_need)
+    addr_id = upsert_addresses(conn, addr_need)
+
+    rows: List[Tuple[int,int,int,int,int,int,int]] = []
+    for bn, txi, logi, token_addr, from_addr, to_addr, amount in parsed:
+        rows.append((
+            bn, txi, logi,
+            token_id[token_addr],
+            addr_id[from_addr],
+            addr_id[to_addr],
+            amount
+        ))
 
     with conn.cursor() as cur:
         cur.executemany(
             """
             INSERT INTO erc20_transfer
-              (block_number, tx_index, log_index, token_addr, from_addr, to_addr, amount)
+              (block_number, tx_index, log_index, token_id, from_id, to_id, amount)
             VALUES (%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (block_number, tx_index, log_index) DO NOTHING
             """,
@@ -371,7 +448,10 @@ def insert_transfer_logs(conn: psycopg.Connection, logs: List[dict]) -> None:
         )
     conn.commit()
 
-def parse_special_event_like_yours(lg: dict, topic0_to_sig: Dict[str, str]) -> Optional[Tuple[int,int,int,bytes,int,Optional[bytes],Optional[bytes],Optional[int]]]:
+def parse_special_events(
+        lg: dict, 
+        topic0_to_sig: Dict[str, str]
+    )-> Optional[Tuple[int,int,int,bytes,int,Optional[bytes],Optional[bytes],Optional[int]]]:
     """
     Inspired by your working parsing logic:
     - Blacklist events: indexed addr in topics[1] OR address in data (fallback)
@@ -464,9 +544,31 @@ def parse_special_event_like_yours(lg: dict, topic0_to_sig: Dict[str, str]) -> O
     # Unknown signature parsing (skip)
     return None
 
-def insert_token_events(conn: psycopg.Connection, rows: List[Tuple[int,int,int,bytes,int,Optional[bytes],Optional[bytes],Optional[int]]]) -> None:
-    if not rows:
+def insert_token_events(conn: psycopg.Connection, rows_raw: List[Tuple[int,int,int,bytes,int,Optional[bytes],Optional[bytes],Optional[int]]]) -> None:
+    if not rows_raw:
         return
+    
+    token_need: List[Optional[bytes]] = []
+    addr_need: List[Optional[bytes]] = []
+
+    for _, _, _, token_addr, _, a0, a1, _ in rows_raw:
+        token_need.append(token_addr)
+        addr_need.extend([a0, a1])
+
+    token_id = upsert_tokens(conn, token_need)
+    addr_id = upsert_addresses(conn, addr_need)
+
+    rows: List[Tuple[int,int,int,int,int,Optional[int],Optional[int],Optional[int]]] = []
+    for bn, txi, logi, token_addr, ev_type, a0, a1, value in rows_raw:
+        rows.append((
+            bn, txi, logi,
+            token_id[token_addr],
+            ev_type,
+            addr_id[a0] if a0 is not None else None,
+            addr_id[a1] if a1 is not None else None,
+            value
+        ))
+
     with conn.cursor() as cur:
         cur.executemany(
             """
@@ -550,7 +652,7 @@ def main():
 
                 rows: List[Tuple[int,int,int,bytes,int,Optional[bytes],Optional[bytes],Optional[int]]] = []
                 for lg in special_logs:
-                    row = parse_special_event_like_yours(lg, topic0_to_sig)
+                    row = parse_special_events(lg, topic0_to_sig)
                     if row is not None:
                         rows.append(row)
                 insert_token_events(conn, rows)
