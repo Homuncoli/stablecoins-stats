@@ -24,6 +24,8 @@ import requests
 import psycopg
 import yaml
 from eth_utils import keccak
+from dotenv import load_dotenv
+load_dotenv()
 
 
 # ---------------- RPC CLIENT (raw JSON-RPC) ---------------- #
