@@ -250,12 +250,12 @@ CREATE TABLE IF NOT EXISTS token (
 );
 
 CREATE TABLE IF NOT EXISTS eth_tx (
-  block_number   INTEGER NOT NULL REFERENCES eth_block(block_number)
+  block_number   INTEGER NOT NULL REFERENCES eth_block(block_number),
   tx_index       INTEGER NOT NULL,
   from_id        INTEGER NOT NULL REFERENCES address(id),
   to_id          INTEGER REFERENCES address(id),
   method_id      BYTEA,
-  PRIMARY KEY (block_number, tx_index),
+  PRIMARY KEY (block_number, tx_index)
 );
 
 CREATE TABLE IF NOT EXISTS erc20_transfer (
@@ -276,8 +276,8 @@ CREATE TABLE IF NOT EXISTS token_event (
   log_index      INTEGER NOT NULL,
   token_id       INTEGER NOT NULL REFERENCES token(id),
   event_type     SMALLINT NOT NULL,
-  a0             INTEGER REFERENCES address(id), 
-  a1             INTEGER REFERENCES address(id), 
+  a0_id          INTEGER REFERENCES address(id), 
+  a1_id          INTEGER REFERENCES address(id), 
   value          NUMERIC(78,0),
   PRIMARY KEY (block_number, tx_index, log_index),
   FOREIGN KEY (block_number, tx_index) REFERENCES eth_tx(block_number, tx_index)
@@ -389,7 +389,7 @@ def insert_blocks_and_txs(conn, blocks):
             cur.executemany(
                 """
                 INSERT INTO eth_tx(
-                  block_number, tx_index, from_addr, to_addr, method_id)
+                  block_number, tx_index, from_id, to_id, method_id)
                 VALUES (%s,%s,%s,%s,%s)
                 ON CONFLICT (block_number, tx_index) DO NOTHING
                 """,
@@ -573,7 +573,7 @@ def insert_token_events(conn: psycopg.Connection, rows_raw: List[Tuple[int,int,i
         cur.executemany(
             """
             INSERT INTO token_event
-              (block_number, tx_index, log_index, token_addr, event_type, a0, a1, value)
+              (block_number, tx_index, log_index, token_id, event_type, a0_id, a1_id, value)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (block_number, tx_index, log_index) DO NOTHING
             """,
