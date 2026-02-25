@@ -366,7 +366,7 @@ def insert_blocks_and_txs(conn, blocks):
             # max_prio = safe_int_hex(tx.get("maxPriorityFeePerGas"))
 
             tx_tmp.append((bn, tx_index, from_addr, to_addr, method_id))
-            addr_need.append([from_addr, to_addr])
+            addr_need.extend([from_addr, to_addr])
     addr_id = upsert_addresses(conn, addr_need)
 
     tx_rows: List[Tuple[int, int, int, Optional[int], Optional[bytes]]] = []
