@@ -28,7 +28,7 @@ def insert_transactions(conn, transactions: list[Transaction]) -> None:
         cur.executemany(
             """
             INSERT INTO transactions (chain, block_number, tx_index, from_id, to_id, method_id, value, gas_price, gas_used, effective_gas_price, success)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (chain, block_number, tx_index) DO NOTHING
             """,
             [(tx.chain, tx.block_number, tx.tx_index, tx.from_id, tx.to_id, tx.method_id, tx.value, tx.gas_price, tx.gas_used, tx.effective_gas_price, tx.success) for tx in transactions]
         )

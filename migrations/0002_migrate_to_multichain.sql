@@ -23,7 +23,9 @@ CREATE TABLE IF NOT EXISTS blocks (
 CREATE TABLE IF NOT EXISTS addresses (
   chain   chain NOT NULL,
   addr    BYTEA NOT NULL,
-  PRIMARY KEY (chain, addr)
+  first   BIGINT NOT NULL,
+  PRIMARY KEY (chain, addr),
+  FOREIGN KEY (chain, first) REFERENCES blocks(chain, number)
 );
 
 CREATE TABLE IF NOT EXISTS tokens (

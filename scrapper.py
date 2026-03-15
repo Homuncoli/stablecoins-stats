@@ -6,6 +6,10 @@ from model.Block import Block
 
 class NodeScrapper(ABC):
     @abstractmethod
+    def get_block_number(self) -> int:
+        pass
+
+    @abstractmethod
     def get_block_by_number(self, block_number: int, fullTrx: bool = False) -> Block:
         pass
 

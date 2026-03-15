@@ -32,15 +32,18 @@ class TronRpcScrapper(NodeScrapper, JsonRpcScraper):
             bool(0), # ToDo: Success unclear
 
         )
+    
+    def get_block_number(self) -> int:
+        return int(self.make_request("eth_blockNumber", [])["result"], 16)
 
     def get_block_by_number(self, block_number: int, fullTrx: bool = False) -> TronBlock:
-        return self.__result_to_block(self._make_request("eth_getBlockByNumber", [hex(block_number), fullTrx])["result"], fullTrx)
+        return self.__result_to_block(self.make_request("eth_getBlockByNumber", [hex(block_number), fullTrx])["result"], fullTrx)
     
     def get_blocks_by_numbers(self, block_numbers: list[int], fullTrx: bool = False) -> list[TronBlock]:
-        return [self.__result_to_block(block["result"], fullTrx) for block in self._make_batch_request("eth_getBlockByNumber", [ [hex(block_number), fullTrx] for block_number in block_numbers])]
+        return [self.__result_to_block(block["result"], fullTrx) for block in self.make_batch_request("eth_getBlockByNumber", [ [hex(block_number), fullTrx] for block_number in block_numbers])]
 
     def get_transaction_receipt(self, tx_hash: str) -> Transaction:
-        return self.__result_to_transaction(self._make_request("eth_getTransactionByHash", [tx_hash])["result"])
+        return self.__result_to_transaction(self.make_request("eth_getTransactionByHash", [tx_hash])["result"])
     
     def get_transaction_receipts(self, tx_hash: list[str]) -> list[Transaction]:
-        return [self.__result_to_transaction(receipt["result"]) for receipt in self._make_batch_request("eth_getTransactionByHash", [ [hash] for hash in tx_hash])]
+        return [self.__result_to_transaction(receipt["result"]) for receipt in self.make_batch_request("eth_getTransactionByHash", [ [hash] for hash in tx_hash])]
