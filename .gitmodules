@@ -1,0 +1,6 @@
+[submodule "tron/googleapis"]
+	path = tron/googleapis
+	url = https://github.com/googleapis/googleapis.git
+[submodule "tron/protos"]
+	path = tron/protos
+	url = https://github.com/tronprotocol/protocol.git
