@@ -5,23 +5,15 @@ from model.Block import Block
 
 
 class NodeScrapper(ABC):
+    ## Gets the current block number of the chain
     @abstractmethod
-    def get_block_number(self) -> int:
+    def get_now_block(self) -> int:
         pass
 
     @abstractmethod
-    def get_block_by_number(self, block_number: int, fullTrx: bool = False) -> Block:
+    def get_blocks_by_range(self, start: int, end: int) -> list[Block]:
         pass
 
     @abstractmethod
-    def get_blocks_by_numbers(self, block_numbers: list[int], fullTrx: bool = False) -> list[Block]:
+    def get_transactions_by_blocks(self, block_numbers: list[int]) -> list[Transaction]:
         pass
-
-    @abstractmethod
-    def get_transaction_receipt(self, tx_hash: str) -> Transaction:
-        pass
-
-    @abstractmethod
-    def get_transaction_receipts(self, tx_hash: list[str]) -> list[Transaction]:
-        pass
-

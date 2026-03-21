@@ -10,4 +10,3 @@ notes.md
 .vscode*
 address_types.json
 venv/
-generated/

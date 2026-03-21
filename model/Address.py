@@ -4,11 +4,16 @@ import psycopg
 from constants import TRON_CHAIN_ID
 from datetime import datetime, timezone
 
+class AddressType:
+    EOA = "EOA"
+    CONTRACT = "CONTRACT"
+
 @dataclass
 class Address:
     chain: str
     addr: bytearray
-    first: int
+    type: AddressType
+    
 
 def insert_addresses(conn: psycopg.Connection, addresses: list[Address]) -> None:
     with conn.cursor() as cur:

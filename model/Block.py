@@ -1,21 +1,13 @@
 from dataclasses import dataclass
 
 import psycopg
-from constants import TRON_CHAIN_ID
-from datetime import datetime, timezone
+from datetime import datetime
 
 @dataclass
 class Block:
     chain: str
     number: int
     ts: datetime
- 
-class TronBlock(Block):
-    transaction_hashes: list[str]
-
-    def __init__(self, number: int, ts: int, transaction_hashes: list[str]):
-        super().__init__(TRON_CHAIN_ID, number, ts)
-        self.transaction_hashes = transaction_hashes
 
 def insert_blocks(conn: psycopg.Connection, blocks: list[Block]) -> None:
     with conn.cursor() as cur:

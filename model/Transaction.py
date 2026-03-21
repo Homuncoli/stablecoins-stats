@@ -1,5 +1,6 @@
 
 from dataclasses import dataclass
+from datetime import datetime
 
 from constants import TRON_CHAIN_ID
 
@@ -8,8 +9,14 @@ from constants import TRON_CHAIN_ID
 class Transaction:
     chain: int
     block_number: int
-    tx_index: int
+    
+    contract: bytearray # ?
+    data: bytearray # ?
+    fee_limit: int # Max. Allowed fee for the transaction, in SUN (1 TRX = 1,000,000 SUN)
+    ts: datetime
 
+
+    tx_index: int
     from_id: bytearray
     to_id: bytearray
     method_id: str
