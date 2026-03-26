@@ -1,7 +1,7 @@
 from json_rpc import JsonRpcScraper
 from model.Block import TronBlock
 from model.Transaction import Transaction, TronTransaction
-from scrapper import NodeScrapper
+from scraper import NodeScraper
 from datetime import datetime, timezone
 
 def tron_input_to_method_id(input: str) -> str:
@@ -10,7 +10,7 @@ def tron_input_to_method_id(input: str) -> str:
 def tron_timestamp_to_block_ts(ts: int) -> int:
     return datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
 
-class TronRpcScrapper(NodeScrapper, JsonRpcScraper):
+class TronRpcScraper(NodeScraper, JsonRpcScraper):
     def __result_to_block(self, result, fullTrx: bool = False) -> TronBlock:
         return TronBlock(
             int(result["number"], 16),

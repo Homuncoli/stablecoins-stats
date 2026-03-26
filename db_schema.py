@@ -1,20 +1,15 @@
 import psycopg
 from pathlib import Path
 
-from model.Block import Block
-
 CREATE_MIGRATIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS migrations (
-    id SERIAL PRIMARY KEY,
-    filename TEXT NOT NULL,
+    filename TEXT PRIMARY KEY,
     applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 """
 CREATE_VERSION_TABLE = """
-CREATE TABLE IF NOT EXISTS version (
-    current TEXT PRIMARY KEY
-);
-INSERT INTO version (current) VALUES ('0000_initial') ON CONFLICT (current) DO NOTHING;
+CREATE OR REPLACE VIEW version AS SELECT filename AS current FROM migrations ORDER BY applied_at DESC LIMIT 1;
+INSERT INTO migrations (filename) VALUES ('0000_initial') ON CONFLICT (filename) DO NOTHING;
 """
 
 def get_current_version(cursor):
@@ -23,7 +18,6 @@ def get_current_version(cursor):
     return row[0] if row else None
 
 def update_version(cursor, filename):
-    cursor.execute("UPDATE version SET current = %s;", (filename,))
     cursor.execute("INSERT INTO migrations (filename) VALUES (%s);", (filename,))
 
 def get_pending_files(current_version, sql_dir: Path = Path("migrations")) -> list[Path]:

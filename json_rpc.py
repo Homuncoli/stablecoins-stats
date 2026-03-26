@@ -24,15 +24,15 @@ class JsonRpcScraper:
         self.session.close()
         return False
 
-    def _make_request(self, method, params):
+    def _make_request(self, method, params, json=True):
         payload = {
             "jsonrpc": "2.0",
             "method": method,
             "params": params,
             "id": 1
         }
-        response = self.session.post(self.rpc_url, data=json.dumps(payload), timeout=self.timeout)
-        return response.json()
+        response = self.session.post(self.rpc_url, data=json.dumps(payload) if json else payload, timeout=self.timeout)
+        return response.json() if json else response
     
     def _make_batch_request(self, method, params_list):
         payload = []
