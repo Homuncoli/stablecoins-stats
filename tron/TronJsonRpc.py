@@ -1,7 +1,7 @@
 from json_rpc import JsonRpcScraper
 from model.Block import TronBlock
 from model.Transaction import Transaction, TronTransaction
-from scrapper import NodeScrapper
+from scraper import NodeScrapper
 from datetime import datetime, timezone
 
 def tron_input_to_method_id(input: str) -> str:

@@ -1,104 +1,189 @@
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import sys
 import os
 import time
 
+import psycopg
+
+from constants import TRON_CHAIN_ID
+from scraper import NodeScraper
+from model.Block import Block
+from model.Transaction import Transaction
+
+import base58
+import hashlib
+
 import grpc
 
 sys.path.insert(0, os.path.abspath('./tron/generated'))
 sys.path.insert(0, os.path.abspath('./'))
+import api.api_pb2 as api
+import api.api_pb2_grpc as tron_api
+from tron.generated.core import Tron_pb2 as protocol
+from tron.generated.core.contract import smart_contract_pb2
 
-from constants import TRON_CHAIN_ID
-from scrapper import NodeScrapper
-from model.Block import Block
-from model.Transaction import Transaction
+VALID_TRANSACTION_TYPES = ['TransferContract', 'TransferAssetContract', 'CustomContract', 'TriggerSmartContract']
 
-import generated.api.api_pb2 as api
-import generated.api.api_pb2_grpc as tron_api
-from generated.core.Tron_pb2 import Block as gRpcBlock
+@dataclass
+class Address:
+    id: int
+    address: bytearray
+    addr_t: str # 'EOA', 'Contract'
 
-def _tron_transaction_info_to_model(tx) -> Transaction:
-    return Transaction(
-        chain=TRON_CHAIN_ID,
-        block_number=tx.blockNumber,
-        tx_index=None,  # Tron does not have a concept of transaction index within a block
-        from_id=None,
-        to_id=None,
-        method_id=None,
-        value=None,
-        gas_price=None,
-        gas_used=None,
-        effective_gas_price=0,
-        success=True
-    )
+class Token:
+    id: int
+    address: Address
+    asset_name: str
+    token_t: str # 'TRX', 'TRC10', 'TRC20', 'TRC721'
 
-def _tron_block_to_model(block: gRpcBlock) -> Block:
-    return Block(
-        chain=TRON_CHAIN_ID,
-        number=block.block_header.raw_data.number,
-        ts=datetime.fromtimestamp(block.block_header.raw_data.timestamp / 1000, tz=timezone.utc),
-    )
+@dataclass
+class Transaction:
+    id: int
+    block: int
+    result: bool
+    ts: datetime
+    transaction_t: str # 'TransferContract', 'TransferAssetContract', 'CustomContract', 'TriggerSmartContract'
+    fee_limit: int | None
+    fee: int | None
+    energy_usage: int | None
+    net_fee: int | None
 
-class TrongRpc(NodeScrapper):
-    def __init__(self, connection_string: str):
+    def __post_init__(self):
+        if self.id is None:
+            raise ValueError("Transaction ID cannot be None")
+        if self.transaction_t not in VALID_TRANSACTION_TYPES:
+            raise ValueError(f"Invalid transaction type: {self.transaction_t}")
+
+    def as_params(self):
+        return (self.id, self.block, self.result, self.ts, self.transaction_t, self.fee_limit, self.fee, self.energy_usage, self.net_fee)
+    
+    def __str__(self):
+        return f"Transaction(id={self.id}, block={self.block}, result={self.result}, ts={self.ts}, transaction_t={self.transaction_t}, fee_limit={self.fee_limit}, fee={self.fee}, energy_usage={self.energy_usage}, net_fee={self.net_fee})"
+
+@dataclass
+class Transfer:
+    transaction: Transaction
+    index: int
+    from_addr: Address
+    to_addr: Address
+    contract: Address
+    reject: bool
+    token: Token
+    value: int
+    transfer_t: str # 'Transaction', 'Internal Transaction', 'Log'
+
+@dataclass
+class Logs:
+    transaction: Transaction
+    index: int
+    address: Address
+    topic0: bytearray | None
+    topic1: bytearray | None
+    topic2: bytearray | None
+    topic3: bytearray | None
+    data: bytearray | None
+
+def flag_for_rerun(block_num: int):
+    print(f"Flagging block {block_num} for re-run")
+
+class TronGRpcScraper(NodeScraper):
+    def __init__(self, stub: tron_api.WalletStub, conn: psycopg.Connection):
         super().__init__()
-        self.channel = grpc.insecure_channel(connection_string, options=[('grpc.max_send_message_length', 100 * 1024 * 1024), ('grpc.max_receive_message_length', 100 * 1024 * 1024)])
-        self.stub = tron_api.WalletStub(self.channel)
+        self.stub = stub
+        self.conn = conn
 
     def get_now_block(self) -> int:
         response = self.stub.GetNowBlock(api.EmptyMessage())
         return response.block_header.raw_data.number
+
+    def __calc_trxID(self, trx) -> str:
+        raw_bytes = trx.raw_data.SerializeToString()
+        return hashlib.sha256(raw_bytes).hexdigest()
+
+    def __pair_transactions_with_infos(self, block, infos):
+        info_by_txid = { info.id.hex(): info for info in infos.transactionInfo }
+        return [ (trx, info_by_txid.get(self.__calc_trxID(trx))) for trx in block.transactions ]
     
-    def get_blocks_by_range(self, start: int, end: int) -> list[Block]:
-        blocks = []
-        for start_num in range(start, end + 1, 100):
-            end_num = min(start_num + 99, end) + 1
-            response = self.stub.GetBlockByLimitNext(api.BlockLimit(startNum=start_num, endNum=end_num))
-            blocks.extend([_tron_block_to_model(block) for block in response.block])
-        return blocks
+    def __trx_to_model(self, block, trx, info, i) -> Transaction:
+        SCALER = 1_000
+        return Transaction(
+            id=block.block_header.raw_data.number * SCALER + i % SCALER,
+            block=block.block_header.raw_data.number,
+            result=bool(info.receipt.result),
+            ts=datetime.fromtimestamp(block.block_header.raw_data.timestamp / 1000, tz=timezone.utc),
+            transaction_t=protocol.Transaction.Contract.ContractType.Name(trx.raw_data.contract[0].type),
+            fee_limit=trx.raw_data.fee_limit,
+            fee=info.fee if info and info.fee is not None else None,
+            # contract_address=info.contract_address if info and info.contract_address is not None else None,
+            energy_usage=info.receipt.energy_usage_total if info and info.receipt.energy_usage_total is not None else None,
+            net_fee=info.receipt.net_fee if info and info.receipt.net_fee is not None else None,
+        )
     
-    def get_transactions_by_blocks(self, block_numbers: list[int]) -> list[Transaction]:
-        transactions = []
-        for block_number in block_numbers:
-            response = self.stub.GetTransactionInfoByBlockNum(api.NumberMessage(num=block_number))
-            transactions.extend([_tron_transaction_info_to_model(tx) for tx in response.transactionInfo])
-        return transactions
+    def __call_info_to_model(self, t_Id, block, trx, owner_address, internal, call_info, i):
+        return (t_Id, i, "Internal Transaction", 
+                call_info.token_id if call_info.tokenId else None, 
+                internal.caller_address, call_info.callValue if call_info.callValue else 0,
+                owner_address, internal.transferTo_address, 
+                bool(internal.rejected))
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+    def handle_block(self, block_num: int) -> Block:
+        block = self.stub.GetBlockByNum(api.NumberMessage(num=block_num))
+        infos = self.stub.GetTransactionInfoByBlockNum(api.NumberMessage(num=block_num))
 
-scraper = TrongRpc('10.9.0.3:50051')
-n = 10000
-BATCH_SIZE = 100
-NUM_WORKERS = 10
+        transactions: list[Transaction] = []
+        addresses: list[Address] = []
+        transfers: list = []
+        for i, (trx, info) in enumerate(self.__pair_transactions_with_infos(block, infos)):
+            if not info:
+                print(f"Warning: No transaction info found for TxID {self.__calc_trxID(trx)} in block {block_num}")
+                flag_for_rerun(block_num)
+                continue
+            
+            owner_address = None
+            match trx.raw_data.contract[0].type:
+                case protocol.Transaction.Contract.ContractType.TriggerSmartContract:
+                    msg = smart_contract_pb2.TriggerSmartContract()
+                    trx.raw_data.contract[0].parameter.Unpack(msg)
+                    owner_address = msg.owner_address
+                    pass
+                case protocol.Transaction.Contract.ContractType.TransferContract:
+                    pass
+                case protocol.Transaction.Contract.ContractType.TransferAssetContract:
+                    pass
+                case protocol.Transaction.Contract.ContractType.CustomContract:
+                    pass
+                case _:
+                    # print(f"Warning: Unhandled transaction type {protocol.Transaction.Contract.ContractType.Name(trx.raw_data.contract[0].type)} in block {block_num}")
+                    continue
 
-def fetch_batch(start):
-    end = start + BATCH_SIZE
-    return scraper.get_blocks_by_range(start, end)
+            transaction = self.__trx_to_model(block, trx, info, i)
+            transactions.append(transaction)
 
-# Fetch blocks in parallel
-ranges = range(10000000, 10000000 + n, BATCH_SIZE)
-blocks = []
+            i = 0
+            if info.internal_transactions:
+                for internal_trx in info.internal_transactions:
+                    for call_info in internal_trx.callValueInfo:
+                        transfers.append(self.__call_info_to_model(transaction.id, block, trx, owner_address, internal_trx, call_info, i))
+                        i += 1
 
-time_start = time.time()
-with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
-    futures = {executor.submit(fetch_batch, start): start for start in ranges}
-    for future in as_completed(futures):
-        blocks.extend(future.result())
+            if info.log:
+                pass
 
-blocks.sort(key=lambda b: b.number)  # as_completed doesn't preserve order
+        try:
+            cur = self.conn.cursor()
+            cur.executemany("INSERT INTO transactions (id, block, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING", [tx.as_params() for tx in transactions])
+            cur.executemany("CALL insert_transfer(%s, %s, %s, %s, %s, %s, %s, %s, %s)", transfers)
+            self.conn.commit()
+        except Exception as e:
+            print(f"Error inserting transactions for block {block_num}: {e}")
+            flag_for_rerun(block_num)
+            return None
 
-# Fetch transactions in parallel
-def fetch_tx_batch(block_numbers):
-    return scraper.get_transactions_by_blocks(block_numbers)
-
-block_numbers = [b.number for b in blocks]
-tx_batches = [block_numbers[i:i + BATCH_SIZE] for i in range(0, len(block_numbers), BATCH_SIZE)]
-transactions = []
-
-with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
-    futures = [executor.submit(fetch_tx_batch, batch) for batch in tx_batches]
-    for future in as_completed(futures):
-        transactions.extend(future.result())
-
-time_end = time.time()
-print(f"Fetched {len(blocks)} blocks and {len(transactions)} transactions in {time_end - time_start:.2f} seconds => {len(blocks) / (time_end - time_start):.2f} blocks/s, {len(transactions) / (time_end - time_start):.2f} tx/s")
+        return block, infos
+    
+    def handle_range(self, start: int, end: int):
+        print(f"Handling blocks {start} to {end}")
+        for block_num in range(start, end + 1):
+            self.handle_block(block_num)
+        pass

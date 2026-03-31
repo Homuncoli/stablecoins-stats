@@ -12,9 +12,10 @@ CREATE TABLE IF NOT EXISTS migrations (
 """
 CREATE_VERSION_TABLE = """
 CREATE TABLE IF NOT EXISTS version (
-    current TEXT PRIMARY KEY
+    id SERIAL PRIMARY KEY,
+    current TEXT NOT NULL
 );
-INSERT INTO version (current) VALUES ('0000_initial') ON CONFLICT (current) DO NOTHING;
+INSERT INTO version (current) VALUES ('0000_initial');
 """
 
 def get_current_version(cursor):
@@ -23,8 +24,8 @@ def get_current_version(cursor):
     return row[0] if row else None
 
 def update_version(cursor, filename):
-    cursor.execute("UPDATE version SET current = %s;", (filename,))
     cursor.execute("INSERT INTO migrations (filename) VALUES (%s);", (filename,))
+    cursor.execute("UPDATE version SET current = %s;", (filename,))
 
 def get_pending_files(current_version, sql_dir: Path = Path("migrations")) -> list[Path]:
     all_files = sorted(sql_dir.glob("*.sql"))
@@ -39,8 +40,10 @@ def run_migration(conn: psycopg.Connection, sql_file: Path) -> None:
     with open(sql_file, "r") as f:
         sql = f.read()
         with conn.cursor() as cur:
+            cur.execute("BEGIN;")
             cur.execute(sql)
             update_version(cur, sql_file.name)
+            cur.execute("COMMIT;")
 
 def ensure_schema(conn: psycopg.Connection, dir: Path = Path("migrations")) -> None:
     print("Ensuring database schema is up to date...")
@@ -52,6 +55,11 @@ def ensure_schema(conn: psycopg.Connection, dir: Path = Path("migrations")) -> N
 
         for sql_file in sql_files:
             print(f"Running migration: {sql_file.name}")
-            run_migration(conn, sql_file)
+            try:
+                run_migration(conn, sql_file)
+            except Exception as e:
+                conn.rollback()
+                print(f"Error occurred while running migration {sql_file.name}: {e}")
+                exit(1)
     conn.commit()
     print("Database schema is up to date.")

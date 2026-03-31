@@ -14,6 +14,7 @@ PROTO_DIRS = [
     "tron/protos/core/contract",
     "tron/protos/core/tron",
     "tron/googleapis/google/api",
+    "tron/googleapis/google/protocol",
 ]
 
 
