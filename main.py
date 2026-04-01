@@ -51,6 +51,10 @@ if __name__ == "__main__":
     ap.add_argument("--tx-consumers", type=int, default=int(os.getenv("TX_CONSUMERS", "2")), help="Number of Postgres transaction writer threads")
     ap.add_argument("--tx-copy-batch-size", type=int, default=int(os.getenv("TX_COPY_BATCH_SIZE", "50000")), help="Rows to buffer before COPY into staging")
     ap.add_argument("--tx-merge-batch-size", type=int, default=int(os.getenv("TX_MERGE_BATCH_SIZE", "500000")), help="Rows in staging before merging into transactions")
+    ap.add_argument("--tx-stage-commit-batch-size", type=int, default=int(os.getenv("TX_STAGE_COMMIT_BATCH_SIZE", "2000000")), help="Rows copied to staging before commit")
+    ap.add_argument("--tx-merge-strategy", choices=["on_conflict", "anti_join"], default=os.getenv("TX_MERGE_STRATEGY", "on_conflict"), help="Merge strategy from staging to transactions")
+    ap.add_argument("--tx-merge-on-shutdown-only", action="store_true", help="Only merge staging into transactions at shutdown")
+    ap.add_argument("--tx-partition-span", type=int, default=int(os.getenv("TX_PARTITION_SPAN", "1000000")), help="Block span per transactions partition")
     ap.add_argument("--tx-queue-timeout", type=int, default=int(os.getenv("TX_QUEUE_TIMEOUT", "2")), help="Queue poll timeout (seconds) for transaction consumers")
     ap.add_argument("--tx-sync-commit", action="store_true", help="Enable synchronous_commit for transaction consumers")
     args = ap.parse_args()
@@ -83,6 +87,12 @@ if __name__ == "__main__":
         scraper = scraperFactory(conn)
         start = args.start
         end = min(args.end, scraper.get_now_block()) if args.end else scraper.get_now_block()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ensure_transactions_partitions_for_range(%s, %s, %s)",
+                (start, end, args.tx_partition_span),
+            )
+        conn.commit()
         chunks = [ (start + i, min(start + i + args.chunk_size - 1, end)) for i in range(0, end - start + 1, args.chunk_size) ]
         logging.info(f"Processing blocks from {start} to {end} in {len(chunks)} chunks of up to {args.chunk_size} blocks each with {args.workers} workers...")
 
@@ -100,6 +110,9 @@ if __name__ == "__main__":
                 "stop_event": consumer_stop_event,
                 "batch_size": args.tx_copy_batch_size,
                 "merge_batch_size": args.tx_merge_batch_size,
+                "merge_on_shutdown_only": args.tx_merge_on_shutdown_only,
+                "merge_strategy": args.tx_merge_strategy,
+                "stage_commit_batch_size": args.tx_stage_commit_batch_size,
                 "queue_timeout": args.tx_queue_timeout,
                 "sync_commit": args.tx_sync_commit,
             },

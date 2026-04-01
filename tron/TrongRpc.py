@@ -268,7 +268,7 @@ class TronGRpcScraper(NodeScraper):
 
         #with timed("db.inserts.transactions"):
         #    cur.executemany("INSERT INTO transactions (id, block, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING", [tx.as_params() for tx in transactions])
-        #with timed("db.inserts.transfers"):
+        with timed("db.inserts"):
         #    cur.executemany("CALL insert_transfer(%s, %s, %s, %s, %s, %s, %s, %s, %s)", transfers)
         #with timed("file.write"):
         #    with open("TRANSACTIONS.csv", "a") as f:
@@ -277,10 +277,10 @@ class TronGRpcScraper(NodeScraper):
         #    with open("IMPORT.csv", "a") as f:
         #        for transfer in transfers:
         #            f.write(f"{transfer[0]},{transfer[1]},{transfer[2]},{transfer[3].hex() if transfer[3] else None},{transfer[4].hex() if transfer[4] else None},{transfer[5] if transfer[5] else None},{transfer[6].hex() if transfer[6] else None},{transfer[7].hex() if transfer[7] else None},{transfer[8]}\n")
-        for tx in transactions:
-            transaction_queue.put(tx.as_params())
-        for transfer in transfers:
-            transfer_queue.put(transfer)
+            for tx in transactions:
+                transaction_queue.put(tx.as_params())
+            for transfer in transfers:
+                transfer_queue.put(transfer)
 
         logger.debug(f"Block {block_num}: {len(transactions)} transactions, {len(transfers)} transfers")
 
@@ -309,6 +309,9 @@ def transaction_consumer(
     stop_event: threading.Event | None = None,
     batch_size: int = 50_000,
     merge_batch_size: int = 500_000,
+    merge_on_shutdown_only: bool = False,
+    merge_strategy: str = "on_conflict",
+    stage_commit_batch_size: int = 2_000_000,
     queue_timeout: int = 20,
     sync_commit: bool = False,
 ):
@@ -316,6 +319,7 @@ def transaction_consumer(
     consumer_logger = logging.getLogger(__name__)
     buffered_rows: list[tuple] = []
     staged_rows = 0
+    staged_since_commit = 0
     staging_table = f"transactions_stage_{consumer_id}_{os.getpid()}"
     staging_table = re.sub(r"[^a-zA-Z0-9_]", "_", staging_table)
 
@@ -342,14 +346,25 @@ def transaction_consumer(
         if staged_rows == 0:
             return 0
 
-        cur.execute(
-            f"""
-            INSERT INTO transactions (id, block, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee)
-            SELECT id, block, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee
-            FROM {staging_table}
-            ON CONFLICT (id) DO NOTHING
-            """
-        )
+        if merge_strategy == "anti_join":
+            cur.execute(
+                f"""
+                INSERT INTO transactions (id, block, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee)
+                SELECT s.id, s.block, s.result, s.ts, s.transaction_t, s.fee_limit, s.fee, s.energy_usage, s.net_fee
+                FROM {staging_table} s
+                LEFT JOIN transactions t ON t.id = s.id
+                WHERE t.id IS NULL
+                """
+            )
+        else:
+            cur.execute(
+                f"""
+                INSERT INTO transactions (id, block, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee)
+                SELECT id, block, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee
+                FROM {staging_table}
+                ON CONFLICT (id) DO NOTHING
+                """
+            )
         cur.execute(f"TRUNCATE {staging_table}")
 
         inserted = staged_rows
@@ -375,6 +390,8 @@ def transaction_consumer(
                     )
                     """
                 )
+                if merge_strategy == "anti_join":
+                    cur.execute(f"CREATE INDEX {staging_table}_id_idx ON {staging_table}(id)")
                 conn.commit()
 
                 if not sync_commit:
@@ -385,32 +402,44 @@ def transaction_consumer(
                         tx = transaction_queue.get(timeout=queue_timeout)
                     except queue.Empty:
                         if stop_event is not None and stop_event.is_set() and transaction_queue.empty():
-                            staged_rows += copy_into_staging(cur)
+                            copied = copy_into_staging(cur)
+                            staged_rows += copied
+                            staged_since_commit += copied
                             inserted = merge_staging(cur)
                             if inserted:
                                 written += inserted
                             conn.commit()
                             break
                         if stop_event is None:
-                            staged_rows += copy_into_staging(cur)
+                            copied = copy_into_staging(cur)
+                            staged_rows += copied
+                            staged_since_commit += copied
                             inserted = merge_staging(cur)
                             if inserted:
                                 written += inserted
                             conn.commit()
                             break
 
-                        staged_rows += copy_into_staging(cur)
-                        if staged_rows >= merge_batch_size:
+                        copied = copy_into_staging(cur)
+                        staged_rows += copied
+                        staged_since_commit += copied
+                        if staged_since_commit >= stage_commit_batch_size:
+                            conn.commit()
+                            staged_since_commit = 0
+                        if (not merge_on_shutdown_only) and staged_rows >= merge_batch_size:
                             inserted = merge_staging(cur)
                             if inserted:
                                 written += inserted
                             conn.commit()
+                            staged_since_commit = 0
                         continue
 
                     try:
                         # Allow graceful shutdown via sentinel value.
                         if tx is None:
-                            staged_rows += copy_into_staging(cur)
+                            copied = copy_into_staging(cur)
+                            staged_rows += copied
+                            staged_since_commit += copied
                             inserted = merge_staging(cur)
                             if inserted:
                                 written += inserted
@@ -420,11 +449,17 @@ def transaction_consumer(
                         buffered_rows.append(tx)
 
                         if len(buffered_rows) >= batch_size:
-                            staged_rows += copy_into_staging(cur)
-                            if staged_rows >= merge_batch_size:
+                            copied = copy_into_staging(cur)
+                            staged_rows += copied
+                            staged_since_commit += copied
+                            if staged_since_commit >= stage_commit_batch_size:
+                                conn.commit()
+                                staged_since_commit = 0
+                            if (not merge_on_shutdown_only) and staged_rows >= merge_batch_size:
                                 inserted = merge_staging(cur)
                                 written += inserted
                                 conn.commit()
+                                staged_since_commit = 0
                     finally:
                         transaction_queue.task_done()
     except KeyboardInterrupt:
