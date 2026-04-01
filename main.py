@@ -48,6 +48,11 @@ if __name__ == "__main__":
     ap.add_argument("--yaml", default=None, help="Optional: stablecoins YAML to ADD more event signatures (NO filtering)")
     ap.add_argument("--debug", type=str, default="INFO", help="Enable debug logging")
     ap.add_argument("--profile-timing", action="store_true", help="Collect and print section timings across all threads")
+    ap.add_argument("--tx-consumers", type=int, default=int(os.getenv("TX_CONSUMERS", "2")), help="Number of Postgres transaction writer threads")
+    ap.add_argument("--tx-copy-batch-size", type=int, default=int(os.getenv("TX_COPY_BATCH_SIZE", "50000")), help="Rows to buffer before COPY into staging")
+    ap.add_argument("--tx-merge-batch-size", type=int, default=int(os.getenv("TX_MERGE_BATCH_SIZE", "500000")), help="Rows in staging before merging into transactions")
+    ap.add_argument("--tx-queue-timeout", type=int, default=int(os.getenv("TX_QUEUE_TIMEOUT", "2")), help="Queue poll timeout (seconds) for transaction consumers")
+    ap.add_argument("--tx-sync-commit", action="store_true", help="Enable synchronous_commit for transaction consumers")
     args = ap.parse_args()
 
     logging.basicConfig(level=getattr(logging, args.debug.upper()), format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -85,19 +90,24 @@ if __name__ == "__main__":
 
     failed_chunks = []
     consumer_stop_event = threading.Event()
-    consumer_thread = threading.Thread(
-        target=transaction_consumer,
-        kwargs={
-            "pg_dsn": args.pg,
-            "stop_event": consumer_stop_event,
-            "batch_size": 10_000,
-            "queue_timeout": 5,
-            "sync_commit": False,
-        },
-        name="transaction-consumer",
-        daemon=True,
-    )
-    consumer_thread.start()
+    consumer_threads: list[threading.Thread] = []
+    for i in range(args.tx_consumers):
+        consumer_thread = threading.Thread(
+            target=transaction_consumer,
+            kwargs={
+                "pg_dsn": args.pg,
+                "consumer_id": i,
+                "stop_event": consumer_stop_event,
+                "batch_size": args.tx_copy_batch_size,
+                "merge_batch_size": args.tx_merge_batch_size,
+                "queue_timeout": args.tx_queue_timeout,
+                "sync_commit": args.tx_sync_commit,
+            },
+            name=f"transaction-consumer-{i}",
+            daemon=True,
+        )
+        consumer_thread.start()
+        consumer_threads.append(consumer_thread)
 
     with ConnectionPool(args.pg, min_size=args.workers, max_size=args.workers) as pool:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
@@ -113,8 +123,10 @@ if __name__ == "__main__":
     # Drain queued transactions before shutdown.
     transaction_queue.join()
     consumer_stop_event.set()
-    transaction_queue.put(None)
-    consumer_thread.join(timeout=30)
+    for _ in range(args.tx_consumers):
+        transaction_queue.put(None)
+    for consumer_thread in consumer_threads:
+        consumer_thread.join(timeout=60)
     close()
     with open(".failed_chunks.txt", "w") as f:
         for chunk_start, chunk_end in failed_chunks:

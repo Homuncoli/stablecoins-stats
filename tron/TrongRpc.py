@@ -1,12 +1,12 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import csv
 import logging
 import random
 import sys
 import os
 import time
 from pathlib import Path
+import re
 
 import psycopg
 from filelock import FileLock
@@ -305,23 +305,27 @@ class TronGRpcScraper(NodeScraper):
 
 def transaction_consumer(
     pg_dsn: str,
+    consumer_id: int = 0,
     stop_event: threading.Event | None = None,
-    batch_size: int = 10_000,
+    batch_size: int = 50_000,
+    merge_batch_size: int = 500_000,
     queue_timeout: int = 20,
     sync_commit: bool = False,
 ):
     written = 0
     consumer_logger = logging.getLogger(__name__)
     buffered_rows: list[tuple] = []
+    staged_rows = 0
+    staging_table = f"transactions_stage_{consumer_id}_{os.getpid()}"
+    staging_table = re.sub(r"[^a-zA-Z0-9_]", "_", staging_table)
 
-    def flush_batch(cur: psycopg.Cursor) -> int:
+    def copy_into_staging(cur: psycopg.Cursor) -> int:
         if not buffered_rows:
             return 0
 
-        cur.execute("TRUNCATE tmp_transactions_copy")
         with cur.copy(
-            """
-            COPY tmp_transactions_copy
+            f"""
+            COPY {staging_table}
             (id, block, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee)
             FROM STDIN
             """
@@ -329,26 +333,36 @@ def transaction_consumer(
             for row in buffered_rows:
                 copy.write_row(row)
 
+        copied = len(buffered_rows)
+        buffered_rows.clear()
+        return copied
+
+    def merge_staging(cur: psycopg.Cursor) -> int:
+        nonlocal staged_rows
+        if staged_rows == 0:
+            return 0
+
         cur.execute(
-            """
+            f"""
             INSERT INTO transactions (id, block, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee)
             SELECT id, block, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee
-            FROM tmp_transactions_copy
+            FROM {staging_table}
             ON CONFLICT (id) DO NOTHING
             """
         )
+        cur.execute(f"TRUNCATE {staging_table}")
 
-        inserted = len(buffered_rows)
-        buffered_rows.clear()
+        inserted = staged_rows
+        staged_rows = 0
         return inserted
 
     try:
         with psycopg.connect(pg_dsn) as conn:
             with conn.cursor() as cur:
-                # Keep a connection-local temp table to combine COPY speed with ON CONFLICT semantics.
                 cur.execute(
-                    """
-                    CREATE TEMP TABLE IF NOT EXISTS tmp_transactions_copy (
+                    f"""
+                    DROP TABLE IF EXISTS {staging_table};
+                    CREATE UNLOGGED TABLE {staging_table} (
                         id bigint,
                         block bigint,
                         result bool,
@@ -358,9 +372,10 @@ def transaction_consumer(
                         fee bigint,
                         energy_usage bigint,
                         net_fee bigint
-                    ) ON COMMIT PRESERVE ROWS
+                    )
                     """
                 )
+                conn.commit()
 
                 if not sync_commit:
                     cur.execute("SET synchronous_commit TO OFF")
@@ -370,39 +385,46 @@ def transaction_consumer(
                         tx = transaction_queue.get(timeout=queue_timeout)
                     except queue.Empty:
                         if stop_event is not None and stop_event.is_set() and transaction_queue.empty():
-                            inserted = flush_batch(cur)
+                            staged_rows += copy_into_staging(cur)
+                            inserted = merge_staging(cur)
                             if inserted:
                                 written += inserted
-                                conn.commit()
+                            conn.commit()
                             break
                         if stop_event is None:
-                            inserted = flush_batch(cur)
+                            staged_rows += copy_into_staging(cur)
+                            inserted = merge_staging(cur)
                             if inserted:
                                 written += inserted
-                                conn.commit()
+                            conn.commit()
                             break
 
-                        inserted = flush_batch(cur)
-                        if inserted:
-                            written += inserted
+                        staged_rows += copy_into_staging(cur)
+                        if staged_rows >= merge_batch_size:
+                            inserted = merge_staging(cur)
+                            if inserted:
+                                written += inserted
                             conn.commit()
                         continue
 
                     try:
                         # Allow graceful shutdown via sentinel value.
                         if tx is None:
-                            inserted = flush_batch(cur)
+                            staged_rows += copy_into_staging(cur)
+                            inserted = merge_staging(cur)
                             if inserted:
                                 written += inserted
-                                conn.commit()
+                            conn.commit()
                             break
 
                         buffered_rows.append(tx)
 
                         if len(buffered_rows) >= batch_size:
-                            inserted = flush_batch(cur)
-                            written += inserted
-                            conn.commit()
+                            staged_rows += copy_into_staging(cur)
+                            if staged_rows >= merge_batch_size:
+                                inserted = merge_staging(cur)
+                                written += inserted
+                                conn.commit()
                     finally:
                         transaction_queue.task_done()
     except KeyboardInterrupt:
@@ -410,4 +432,11 @@ def transaction_consumer(
     except Exception:
         consumer_logger.exception("transaction_consumer failed")
     finally:
+        try:
+            with psycopg.connect(pg_dsn) as cleanup_conn:
+                with cleanup_conn.cursor() as cleanup_cur:
+                    cleanup_cur.execute(f"DROP TABLE IF EXISTS {staging_table}")
+                cleanup_conn.commit()
+        except Exception:
+            consumer_logger.debug("failed to drop staging table %s", staging_table, exc_info=True)
         consumer_logger.info("transaction_consumer stopped after writing %d rows to postgres", written)
