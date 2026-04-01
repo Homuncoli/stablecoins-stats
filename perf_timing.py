@@ -57,19 +57,49 @@ class TimingRegistry:
 
         items.sort(key=lambda x: x[1].total_ns, reverse=True)
 
-        lines = [
-            "Timing summary across all threads (sorted by total time):",
-            "section | calls | avg_ms | total_ms | min_ms | max_ms",
-        ]
-
+        headers = ("section", "calls", "%", "avg_ms", "total_ms", "min_ms", "max_ms")
+        rows: list[tuple[str, str, str, str, str, str, str]] = []
+        grand_total_ns = sum(s.total_ns for _, s in items)
         for name, s in items:
+            pct_total = (s.total_ns / grand_total_ns * 100.0) if grand_total_ns else 0.0
             avg_ms = (s.total_ns / s.count) / 1_000_000 if s.count else 0.0
             total_ms = s.total_ns / 1_000_000
             min_ms = s.min_ns / 1_000_000
             max_ms = s.max_ns / 1_000_000
-            lines.append(
-                f"{name} | {s.count} | {avg_ms:.3f} | {total_ms:.3f} | {min_ms:.3f} | {max_ms:.3f}"
+            rows.append(
+                (
+                    name,
+                    str(s.count),
+                    f"{pct_total:.1f}%",
+                    f"{avg_ms:.3f}",
+                    f"{total_ms:.3f}",
+                    f"{min_ms:.3f}",
+                    f"{max_ms:.3f}",
+                )
             )
+
+        widths = [
+            max(len(headers[col]), *(len(row[col]) for row in rows))
+            for col in range(len(headers))
+        ]
+
+        row_format = " | ".join(
+            [
+                f"{{:<{widths[0]}}}",
+                f"{{:>{widths[1]}}}",
+                f"{{:>{widths[2]}}}",
+                f"{{:>{widths[3]}}}",
+                f"{{:>{widths[4]}}}",
+                f"{{:>{widths[5]}}}",
+                f"{{:>{widths[6]}}}",
+            ]
+        )
+
+        lines = ["Timing summary across all threads (sorted by total time):"]
+        lines.append(row_format.format(*headers))
+        lines.append("-+-".join("-" * w for w in widths))
+        for row in rows:
+            lines.append(row_format.format(*row))
 
         return lines
 

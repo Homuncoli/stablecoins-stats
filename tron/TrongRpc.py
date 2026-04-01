@@ -26,6 +26,8 @@ sys.path.insert(0, os.path.abspath('./'))
 import api.api_pb2 as api
 import api.api_pb2_grpc as tron_api
 from tron.generated.core import Tron_pb2 as protocol
+from tron.generated.core.contract import asset_issue_contract_pb2
+from tron.generated.core.contract import balance_contract_pb2
 from tron.generated.core.contract import smart_contract_pb2
 
 VALID_TRANSACTION_TYPES = ['TransferContract', 'TransferAssetContract', 'CustomContract', 'TriggerSmartContract']
@@ -124,6 +126,62 @@ class TronGRpcScraper(NodeScraper):
     def __pair_transactions_with_infos(self, block, infos):
         info_by_txid = { info.id.hex(): info for info in infos.transactionInfo }
         return [ (trx, info_by_txid.get(self.__calc_trxID(trx))) for trx in block.transactions ]
+
+    def __extract_len_delimited_field(self, payload: bytes, field_number: int) -> bytes | None:
+        i = 0
+        n = len(payload)
+
+        while i < n:
+            key = 0
+            shift = 0
+            while i < n:
+                b = payload[i]
+                i += 1
+                key |= (b & 0x7F) << shift
+                if (b & 0x80) == 0:
+                    break
+                shift += 7
+            else:
+                return None
+
+            wire_type = key & 0x07
+            number = key >> 3
+
+            if wire_type == 0:
+                while i < n and (payload[i] & 0x80):
+                    i += 1
+                i += 1
+            elif wire_type == 1:
+                i += 8
+            elif wire_type == 2:
+                length = 0
+                shift = 0
+                while i < n:
+                    b = payload[i]
+                    i += 1
+                    length |= (b & 0x7F) << shift
+                    if (b & 0x80) == 0:
+                        break
+                    shift += 7
+                else:
+                    return None
+
+                if i + length > n:
+                    return None
+
+                value = payload[i:i + length]
+                i += length
+                if number == field_number:
+                    return value
+            elif wire_type == 5:
+                i += 4
+            else:
+                return None
+
+            if i > n:
+                return None
+
+        return None
     
     def __trx_to_model(self, block, trx, info, i) -> Transaction:
         SCALER = 1_000
@@ -170,13 +228,19 @@ class TronGRpcScraper(NodeScraper):
                         msg = smart_contract_pb2.TriggerSmartContract()
                         trx.raw_data.contract[0].parameter.Unpack(msg)
                         owner_address = msg.owner_address
-                        pass
                     case protocol.Transaction.Contract.ContractType.TransferContract:
-                        pass
+                        msg = balance_contract_pb2.TransferContract()
+                        trx.raw_data.contract[0].parameter.Unpack(msg)
+                        owner_address = msg.owner_address
                     case protocol.Transaction.Contract.ContractType.TransferAssetContract:
-                        pass
+                        msg = asset_issue_contract_pb2.TransferAssetContract()
+                        trx.raw_data.contract[0].parameter.Unpack(msg)
+                        owner_address = msg.owner_address
                     case protocol.Transaction.Contract.ContractType.CustomContract:
-                        pass
+                        owner_address = self.__extract_len_delimited_field(
+                            trx.raw_data.contract[0].parameter.value,
+                            1,
+                        )
                     case _:
                         # logger.warning("Unhandled transaction type %s in block %d", protocol.Transaction.Contract.ContractType.Name(trx.raw_data.contract[0].type), block_num)
                         continue
