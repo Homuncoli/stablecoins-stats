@@ -258,11 +258,18 @@ class TronGRpcScraper(NodeScraper):
                 if info.log:
                     pass
 
-        with timed("db.inserts.transactions"):
-            cur.executemany("INSERT INTO transactions (id, block, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING", [tx.as_params() for tx in transactions])
-        with timed("db.inserts.transfers"):
-            cur.executemany("CALL insert_transfer(%s, %s, %s, %s, %s, %s, %s, %s, %s)", transfers)
-        
+        #with timed("db.inserts.transactions"):
+        #    cur.executemany("INSERT INTO transactions (id, block, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING", [tx.as_params() for tx in transactions])
+        #with timed("db.inserts.transfers"):
+        #    cur.executemany("CALL insert_transfer(%s, %s, %s, %s, %s, %s, %s, %s, %s)", transfers)
+        with timed("file.write"):
+            with open("TRANSACTIONS.csv", "a") as f:
+                for tx in transactions:
+                    f.write(f"{tx.id},{tx.block},{tx.result},{tx.ts.isoformat()},{tx.transaction_t},{tx.fee_limit},{tx.fee},{tx.energy_usage},{tx.net_fee}\n")
+            with open("IMPORT.csv", "a") as f:
+                for transfer in transfers:
+                    f.write(f"{transfer[0]},{transfer[1]},{transfer[2]},{transfer[3].hex() if transfer[3] else None},{transfer[4].hex() if transfer[4] else None},{transfer[5] if transfer[5] else None},{transfer[6].hex() if transfer[6] else None},{transfer[7].hex() if transfer[7] else None},{transfer[8]}\n")
+
         logger.debug(f"Block {block_num}: {len(transactions)} transactions, {len(transfers)} transfers")
 
         return block, infos
