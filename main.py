@@ -12,11 +12,12 @@ from db_schema import ensure_schema
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import logging
+import threading
 
 import grpc
 from perf_timing import TIMING
 
-from tron.TrongRpc import TronGRpcScraper
+from tron.TrongRpc import TronGRpcScraper, transaction_consumer, transaction_queue
 
 sys.path.insert(0, os.path.abspath('./tron/generated'))
 sys.path.insert(0, os.path.abspath('./'))
@@ -83,6 +84,15 @@ if __name__ == "__main__":
     start_time = time.time()
 
     failed_chunks = []
+    consumer_stop_event = threading.Event()
+    consumer_thread = threading.Thread(
+        target=transaction_consumer,
+        kwargs={"output_csv": "TRANSACTIONS.csv", "stop_event": consumer_stop_event},
+        name="transaction-consumer",
+        daemon=True,
+    )
+    consumer_thread.start()
+
     with ConnectionPool(args.pg, min_size=args.workers, max_size=args.workers) as pool:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             futures = [ executor.submit(scrape, scraperFactory, pool, chunk_start, chunk_end, logging.getLogger(f"Chunk {i+1}({chunk_start}-{chunk_end})")) for i, (chunk_start, chunk_end) in enumerate(chunks) ]
@@ -93,6 +103,12 @@ if __name__ == "__main__":
                 except Exception as e:
                     failed_chunks.append((args.start + args.chunk_size * i, args.start + args.chunk_size * (i + 1) - 1))
                     logging.error(f"Error processing chunk: {e}")
+
+    # Drain queued transactions before shutdown.
+    transaction_queue.join()
+    consumer_stop_event.set()
+    transaction_queue.put(None)
+    consumer_thread.join(timeout=30)
     close()
     with open(".failed_chunks.txt", "w") as f:
         for chunk_start, chunk_end in failed_chunks:

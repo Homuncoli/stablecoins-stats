@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import csv
 import logging
 import random
 import sys
@@ -31,6 +32,13 @@ from tron.generated.core.contract import balance_contract_pb2
 from tron.generated.core.contract import smart_contract_pb2
 
 VALID_TRANSACTION_TYPES = ['TransferContract', 'TransferAssetContract', 'CustomContract', 'TriggerSmartContract']
+
+import queue
+import threading
+import time
+
+transaction_queue = queue.Queue()
+transfer_queue = queue.Queue()
 
 @dataclass
 class Address:
@@ -262,13 +270,17 @@ class TronGRpcScraper(NodeScraper):
         #    cur.executemany("INSERT INTO transactions (id, block, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING", [tx.as_params() for tx in transactions])
         #with timed("db.inserts.transfers"):
         #    cur.executemany("CALL insert_transfer(%s, %s, %s, %s, %s, %s, %s, %s, %s)", transfers)
-        with timed("file.write"):
-            with open("TRANSACTIONS.csv", "a") as f:
-                for tx in transactions:
-                    f.write(f"{tx.id},{tx.block},{tx.result},{tx.ts.isoformat()},{tx.transaction_t},{tx.fee_limit},{tx.fee},{tx.energy_usage},{tx.net_fee}\n")
-            with open("IMPORT.csv", "a") as f:
-                for transfer in transfers:
-                    f.write(f"{transfer[0]},{transfer[1]},{transfer[2]},{transfer[3].hex() if transfer[3] else None},{transfer[4].hex() if transfer[4] else None},{transfer[5] if transfer[5] else None},{transfer[6].hex() if transfer[6] else None},{transfer[7].hex() if transfer[7] else None},{transfer[8]}\n")
+        #with timed("file.write"):
+        #    with open("TRANSACTIONS.csv", "a") as f:
+        #        for tx in transactions:
+        #            f.write(f"{tx.id},{tx.block},{tx.result},{tx.ts.isoformat()},{tx.transaction_t},{tx.fee_limit},{tx.fee},{tx.energy_usage},{tx.net_fee}\n")
+        #    with open("IMPORT.csv", "a") as f:
+        #        for transfer in transfers:
+        #            f.write(f"{transfer[0]},{transfer[1]},{transfer[2]},{transfer[3].hex() if transfer[3] else None},{transfer[4].hex() if transfer[4] else None},{transfer[5] if transfer[5] else None},{transfer[6].hex() if transfer[6] else None},{transfer[7].hex() if transfer[7] else None},{transfer[8]}\n")
+        for tx in transactions:
+            transaction_queue.put(tx.as_params())
+        for transfer in transfers:
+            transfer_queue.put(transfer)
 
         logger.debug(f"Block {block_num}: {len(transactions)} transactions, {len(transfers)} transfers")
 
@@ -290,3 +302,46 @@ class TronGRpcScraper(NodeScraper):
                 logger.exception("Failed to process block %d", block_num)
                 flag_for_rerun(block_num)
         logger.info(f"Finished")
+
+def transaction_consumer(
+    output_csv: str = "TRANSACTIONS.csv",
+    stop_event: threading.Event | None = None,
+    flush_interval: int = 500,
+    queue_timeout: int = 20,
+):
+    written = 0
+    consumer_logger = logging.getLogger(__name__)
+
+    try:
+        with open(output_csv, "a", newline="", encoding="utf-8") as csv_file:
+            writer = csv.writer(csv_file)
+
+            while True:
+                try:
+                    tx = transaction_queue.get(timeout=queue_timeout)
+                except queue.Empty:
+                    # Exit when shutdown is requested and nothing is left to consume.
+                    if stop_event is not None and stop_event.is_set() and transaction_queue.empty():
+                        break
+                    # Backwards-compatible behavior: stop if queue stays empty.
+                    if stop_event is None:
+                        break
+                    continue
+
+                try:
+                    # Allow graceful shutdown via sentinel value.
+                    if tx is None:
+                        break
+
+                    writer.writerow(tx)
+                    written += 1
+
+                    if written % flush_interval == 0:
+                        csv_file.flush()
+                        os.fsync(csv_file.fileno())
+                finally:
+                    transaction_queue.task_done()
+    except KeyboardInterrupt:
+        consumer_logger.info("transaction_consumer interrupted; shutting down cleanly")
+    finally:
+        consumer_logger.info("transaction_consumer stopped after writing %d rows to %s", written, output_csv)
