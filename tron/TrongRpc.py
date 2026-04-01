@@ -304,44 +304,110 @@ class TronGRpcScraper(NodeScraper):
         logger.info(f"Finished")
 
 def transaction_consumer(
-    output_csv: str = "TRANSACTIONS.csv",
+    pg_dsn: str,
     stop_event: threading.Event | None = None,
-    flush_interval: int = 500,
+    batch_size: int = 10_000,
     queue_timeout: int = 20,
+    sync_commit: bool = False,
 ):
     written = 0
     consumer_logger = logging.getLogger(__name__)
+    buffered_rows: list[tuple] = []
+
+    def flush_batch(cur: psycopg.Cursor) -> int:
+        if not buffered_rows:
+            return 0
+
+        cur.execute("TRUNCATE tmp_transactions_copy")
+        with cur.copy(
+            """
+            COPY tmp_transactions_copy
+            (id, block, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee)
+            FROM STDIN
+            """
+        ) as copy:
+            for row in buffered_rows:
+                copy.write_row(row)
+
+        cur.execute(
+            """
+            INSERT INTO transactions (id, block, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee)
+            SELECT id, block, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee
+            FROM tmp_transactions_copy
+            ON CONFLICT (id) DO NOTHING
+            """
+        )
+
+        inserted = len(buffered_rows)
+        buffered_rows.clear()
+        return inserted
 
     try:
-        with open(output_csv, "a", newline="", encoding="utf-8") as csv_file:
-            writer = csv.writer(csv_file)
+        with psycopg.connect(pg_dsn) as conn:
+            with conn.cursor() as cur:
+                # Keep a connection-local temp table to combine COPY speed with ON CONFLICT semantics.
+                cur.execute(
+                    """
+                    CREATE TEMP TABLE IF NOT EXISTS tmp_transactions_copy (
+                        id bigint,
+                        block bigint,
+                        result bool,
+                        ts timestamp,
+                        transaction_t transaction_type,
+                        fee_limit bigint,
+                        fee bigint,
+                        energy_usage bigint,
+                        net_fee bigint
+                    ) ON COMMIT PRESERVE ROWS
+                    """
+                )
 
-            while True:
-                try:
-                    tx = transaction_queue.get(timeout=queue_timeout)
-                except queue.Empty:
-                    # Exit when shutdown is requested and nothing is left to consume.
-                    if stop_event is not None and stop_event.is_set() and transaction_queue.empty():
-                        break
-                    # Backwards-compatible behavior: stop if queue stays empty.
-                    if stop_event is None:
-                        break
-                    continue
+                if not sync_commit:
+                    cur.execute("SET synchronous_commit TO OFF")
 
-                try:
-                    # Allow graceful shutdown via sentinel value.
-                    if tx is None:
-                        break
+                while True:
+                    try:
+                        tx = transaction_queue.get(timeout=queue_timeout)
+                    except queue.Empty:
+                        if stop_event is not None and stop_event.is_set() and transaction_queue.empty():
+                            inserted = flush_batch(cur)
+                            if inserted:
+                                written += inserted
+                                conn.commit()
+                            break
+                        if stop_event is None:
+                            inserted = flush_batch(cur)
+                            if inserted:
+                                written += inserted
+                                conn.commit()
+                            break
 
-                    writer.writerow(tx)
-                    written += 1
+                        inserted = flush_batch(cur)
+                        if inserted:
+                            written += inserted
+                            conn.commit()
+                        continue
 
-                    if written % flush_interval == 0:
-                        csv_file.flush()
-                        os.fsync(csv_file.fileno())
-                finally:
-                    transaction_queue.task_done()
+                    try:
+                        # Allow graceful shutdown via sentinel value.
+                        if tx is None:
+                            inserted = flush_batch(cur)
+                            if inserted:
+                                written += inserted
+                                conn.commit()
+                            break
+
+                        buffered_rows.append(tx)
+
+                        if len(buffered_rows) >= batch_size:
+                            inserted = flush_batch(cur)
+                            written += inserted
+                            conn.commit()
+                    finally:
+                        transaction_queue.task_done()
     except KeyboardInterrupt:
         consumer_logger.info("transaction_consumer interrupted; shutting down cleanly")
+    except Exception:
+        consumer_logger.exception("transaction_consumer failed")
     finally:
-        consumer_logger.info("transaction_consumer stopped after writing %d rows to %s", written, output_csv)
+        consumer_logger.info("transaction_consumer stopped after writing %d rows to postgres", written)

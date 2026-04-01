@@ -87,7 +87,13 @@ if __name__ == "__main__":
     consumer_stop_event = threading.Event()
     consumer_thread = threading.Thread(
         target=transaction_consumer,
-        kwargs={"output_csv": "TRANSACTIONS.csv", "stop_event": consumer_stop_event},
+        kwargs={
+            "pg_dsn": args.pg,
+            "stop_event": consumer_stop_event,
+            "batch_size": 10_000,
+            "queue_timeout": 5,
+            "sync_commit": False,
+        },
         name="transaction-consumer",
         daemon=True,
     )
