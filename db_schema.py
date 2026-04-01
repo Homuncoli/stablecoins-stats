@@ -15,7 +15,12 @@ CREATE TABLE IF NOT EXISTS version (
     id SERIAL PRIMARY KEY,
     current TEXT NOT NULL
 );
-INSERT INTO version (current) VALUES ('0000_initial');
+"""
+
+ENSURE_INITIAL_VERSION = """
+INSERT INTO version (current)
+SELECT '0000_initial'
+WHERE NOT EXISTS (SELECT 1 FROM version);
 """
 
 def get_current_version(cursor):
@@ -39,27 +44,32 @@ def get_pending_files(current_version, sql_dir: Path = Path("migrations")) -> li
 def run_migration(conn: psycopg.Connection, sql_file: Path) -> None:
     with open(sql_file, "r") as f:
         sql = f.read()
-        with conn.cursor() as cur:
-            cur.execute("BEGIN;")
-            cur.execute(sql)
-            update_version(cur, sql_file.name)
-            cur.execute("COMMIT;")
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        update_version(cur, sql_file.name)
 
 def ensure_schema(conn: psycopg.Connection, dir: Path = Path("migrations")) -> None:
     print("Ensuring database schema is up to date...")
     with conn.cursor() as cur:
         cur.execute(CREATE_MIGRATIONS_TABLE)
         cur.execute(CREATE_VERSION_TABLE)
+        cur.execute(ENSURE_INITIAL_VERSION)
 
-        sql_files = get_pending_files(get_current_version(conn.cursor()), dir)
-
-        for sql_file in sql_files:
-            print(f"Running migration: {sql_file.name}")
-            try:
-                run_migration(conn, sql_file)
-            except Exception as e:
-                conn.rollback()
-                print(f"Error occurred while running migration {sql_file.name}: {e}")
-                exit(1)
     conn.commit()
+
+    with conn.cursor() as cur:
+        current_version = get_current_version(cur)
+
+    sql_files = get_pending_files(current_version, dir)
+
+    for sql_file in sql_files:
+        print(f"Running migration: {sql_file.name}")
+        try:
+            run_migration(conn, sql_file)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"Error occurred while running migration {sql_file.name}: {e}")
+            exit(1)
+
     print("Database schema is up to date.")
