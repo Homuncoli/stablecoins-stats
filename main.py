@@ -11,7 +11,10 @@ from db_schema import ensure_schema
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import logging
+
 import grpc
+from perf_timing import TIMING
 
 from tron.TrongRpc import TronGRpcScraper
 
@@ -24,10 +27,10 @@ from core.Tron_pb2 import Block as gRpcBlock
 
 load_dotenv()
 
-def run_scraper(scraperFactory, pool, start, end):
+def scrape(factory, pool, start, end, logger):
     with pool.connection() as conn:
-        scraper = scraperFactory(conn)
-        scraper.handle_range(start, end)
+        scraper = factory(conn)
+        scraper.handle_range(start, end, logger)
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -42,7 +45,15 @@ if __name__ == "__main__":
     ap.add_argument("--timeout", type=int, default=int(os.getenv("RPC_TIMEOUT", "60")))
     ap.add_argument("--retries", type=int, default=int(os.getenv("RPC_MAX_RETRIES", "3")), help="Max JSON-RPC request retries")
     ap.add_argument("--yaml", default=None, help="Optional: stablecoins YAML to ADD more event signatures (NO filtering)")
+    ap.add_argument("--debug", type=str, default="INFO", help="Enable debug logging")
+    ap.add_argument("--profile-timing", action="store_true", help="Collect and print section timings across all threads")
     args = ap.parse_args()
+
+    logging.basicConfig(level=getattr(logging, args.debug.upper()), format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+    if args.profile_timing:
+        TIMING.clear()
+        TIMING.enable()
 
     if not args.rpc:
         raise SystemExit("Missing --rpc or RPC_URL")
@@ -50,11 +61,13 @@ if __name__ == "__main__":
         raise SystemExit("Missing --pg or PG_DSN")
     
     scraperFactory = None
+    close = None
     match args.chain.lower():
         case "tron":
                 channel = grpc.insecure_channel(args.rpc, options=[('grpc.max_send_message_length', 100 * 1024 * 1024), ('grpc.max_receive_message_length', 100 * 1024 * 1024)])
                 stub = tron_api.WalletStub(channel)
                 scraperFactory = lambda conn: TronGRpcScraper(stub, conn)
+                close = channel.close
         case _:
             raise SystemExit(f"Unsupported chain: {args.chain}")
 
@@ -65,17 +78,28 @@ if __name__ == "__main__":
         start = args.start
         end = min(args.end, scraper.get_now_block()) if args.end else scraper.get_now_block()
         chunks = [ (start + i, min(start + i + args.chunk_size - 1, end)) for i in range(0, end - start + 1, args.chunk_size) ]
+        logging.info(f"Processing blocks from {start} to {end} in {len(chunks)} chunks of up to {args.chunk_size} blocks each with {args.workers} workers...")
 
     start_time = time.time()
+
+    failed_chunks = []
     with ConnectionPool(args.pg, min_size=args.workers, max_size=args.workers) as pool:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            futures = [ executor.submit(run_scraper, scraperFactory, pool, range[0], range[1]) for i, range in enumerate(chunks) ]
+            futures = [ executor.submit(scrape, scraperFactory, pool, chunk_start, chunk_end, logging.getLogger(f"Chunk {i+1}({chunk_start}-{chunk_end})")) for i, (chunk_start, chunk_end) in enumerate(chunks) ]
 
-            for future in as_completed(futures):
+            for i, future in enumerate(as_completed(futures)):
                 try:
                     future.result()
                 except Exception as e:
-                    print(f"Error processing chunk: {e}")
-                    raise e
+                    failed_chunks.append((args.start + args.chunk_size * i, args.start + args.chunk_size * (i + 1) - 1))
+                    logging.error(f"Error processing chunk: {e}")
+    close()
+    with open(".failed_chunks.txt", "w") as f:
+        for chunk_start, chunk_end in failed_chunks:
+            f.write(f"{chunk_start}-{chunk_end}\n")
+
     end_time = time.time()
-    print(f"Finished processing blocks {start} to {end} in {end_time - start_time:.2f} seconds => {(end - start + 1) / (end_time - start_time):.2f} blocks/sec")
+    logging.info(f"Finished processing blocks {start} to {end} in {end_time - start_time:.2f} seconds => {(end - start + 1) / (end_time - start_time):.2f} blocks/sec")
+    if args.profile_timing:
+        for line in TIMING.report_lines():
+            logging.info(line)

@@ -27,8 +27,8 @@ create table if not exists transactions (
 	ts timestamp not null,
 	transaction_t transaction_type not null,
 	
-	fee_limit int,
-	fee int,
+	fee_limit bigint,
+	fee bigint,
 	energy_usage bigint,
 	net_fee bigint
 );
@@ -40,7 +40,6 @@ create table if not exists transfers (
 	
 	token int not null references token(id),
 	value bigint not null,
-	contract int not null references addresses(id),
 	to_addr int not null references addresses(id),
 	from_addr int not null references addresses(id),
 	rejected bool,

@@ -1,6 +1,6 @@
 import psycopg
 from pathlib import Path
-
+import logging
 from model.Block import Block
 
 CREATE_MIGRATIONS_TABLE = """
@@ -22,6 +22,8 @@ INSERT INTO version (current)
 SELECT '0000_initial'
 WHERE NOT EXISTS (SELECT 1 FROM version);
 """
+
+logger = logging.getLogger(__name__)
 
 def get_current_version(cursor):
     cursor.execute("SELECT current FROM version LIMIT 1")
@@ -49,12 +51,11 @@ def run_migration(conn: psycopg.Connection, sql_file: Path) -> None:
         update_version(cur, sql_file.name)
 
 def ensure_schema(conn: psycopg.Connection, dir: Path = Path("migrations")) -> None:
-    print("Ensuring database schema is up to date...")
+    logger.info("Ensuring database schema is up to date...")
     with conn.cursor() as cur:
         cur.execute(CREATE_MIGRATIONS_TABLE)
         cur.execute(CREATE_VERSION_TABLE)
         cur.execute(ENSURE_INITIAL_VERSION)
-
     conn.commit()
 
     with conn.cursor() as cur:
@@ -63,13 +64,13 @@ def ensure_schema(conn: psycopg.Connection, dir: Path = Path("migrations")) -> N
     sql_files = get_pending_files(current_version, dir)
 
     for sql_file in sql_files:
-        print(f"Running migration: {sql_file.name}")
+        logger.info(f"Running migration: {sql_file.name}")
         try:
             run_migration(conn, sql_file)
             conn.commit()
         except Exception as e:
             conn.rollback()
-            print(f"Error occurred while running migration {sql_file.name}: {e}")
+            logger.fatal(f"Error occurred while running migration {sql_file.name}: {e}")
             exit(1)
 
-    print("Database schema is up to date.")
+    logger.info("Database schema is up to date.")

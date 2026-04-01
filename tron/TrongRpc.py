@@ -1,10 +1,14 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import logging
+import random
 import sys
 import os
 import time
+from pathlib import Path
 
 import psycopg
+from filelock import FileLock
 
 from constants import TRON_CHAIN_ID
 from scraper import NodeScraper
@@ -15,6 +19,7 @@ import base58
 import hashlib
 
 import grpc
+from perf_timing import timed
 
 sys.path.insert(0, os.path.abspath('./tron/generated'))
 sys.path.insert(0, os.path.abspath('./'))
@@ -84,8 +89,23 @@ class Logs:
     topic3: bytearray | None
     data: bytearray | None
 
-def flag_for_rerun(block_num: int):
-    print(f"Flagging block {block_num} for re-run")
+_RERUN_QUEUE_FILE = Path("./.rerun_queue")
+_RERUN_QUEUE_LOCK = FileLock(str(_RERUN_QUEUE_FILE) + ".lock", timeout=10)
+
+def flag_for_rerun(block_nums: list[int] | int):
+    try:
+        with _RERUN_QUEUE_LOCK:
+            with open(_RERUN_QUEUE_FILE, 'a') as f:
+                if isinstance(block_nums, list):
+                    for block_num in block_nums:
+                        f.write(f"{block_num},")
+                    f.write("\n")
+                else:
+                    f.write(f"{block_nums}\n")
+                f.flush()
+                os.fsync(f.fileno())
+    except Exception as e:
+        logging.error(f"Failed to write block {block_num} to rerun queue: {e}")
 
 class TronGRpcScraper(NodeScraper):
     def __init__(self, stub: tron_api.WalletStub, conn: psycopg.Connection):
@@ -122,68 +142,80 @@ class TronGRpcScraper(NodeScraper):
     
     def __call_info_to_model(self, t_Id, block, trx, owner_address, internal, call_info, i):
         return (t_Id, i, "Internal Transaction", 
-                call_info.token_id if call_info.tokenId else None, 
-                internal.caller_address, call_info.callValue if call_info.callValue else 0,
+                call_info.tokenId if call_info.tokenId else None, 
+                None if call_info.tokenId else internal.caller_address, call_info.callValue if call_info.callValue else 0,
                 owner_address, internal.transferTo_address, 
                 bool(internal.rejected))
 
-    def handle_block(self, block_num: int) -> Block:
-        block = self.stub.GetBlockByNum(api.NumberMessage(num=block_num))
-        infos = self.stub.GetTransactionInfoByBlockNum(api.NumberMessage(num=block_num))
+    def handle_block(self, block_num: int, cur: psycopg.Cursor, logger: logging.Logger) -> Block:
+        with timed("tron.grpc.GRPC"):
+            block = self.stub.GetBlockByNum(api.NumberMessage(num=block_num))
+            infos = self.stub.GetTransactionInfoByBlockNum(api.NumberMessage(num=block_num))
 
-        transactions: list[Transaction] = []
-        addresses: list[Address] = []
-        transfers: list = []
-        for i, (trx, info) in enumerate(self.__pair_transactions_with_infos(block, infos)):
-            if not info:
-                print(f"Warning: No transaction info found for TxID {self.__calc_trxID(trx)} in block {block_num}")
-                flag_for_rerun(block_num)
-                continue
-            
-            owner_address = None
-            match trx.raw_data.contract[0].type:
-                case protocol.Transaction.Contract.ContractType.TriggerSmartContract:
-                    msg = smart_contract_pb2.TriggerSmartContract()
-                    trx.raw_data.contract[0].parameter.Unpack(msg)
-                    owner_address = msg.owner_address
-                    pass
-                case protocol.Transaction.Contract.ContractType.TransferContract:
-                    pass
-                case protocol.Transaction.Contract.ContractType.TransferAssetContract:
-                    pass
-                case protocol.Transaction.Contract.ContractType.CustomContract:
-                    pass
-                case _:
-                    # print(f"Warning: Unhandled transaction type {protocol.Transaction.Contract.ContractType.Name(trx.raw_data.contract[0].type)} in block {block_num}")
+        with timed("processing"):
+            transactions: list[Transaction] = []
+            addresses: list[Address] = []
+            transfers: list = []
+            paired_transactions = self.__pair_transactions_with_infos(block, infos)
+
+            for i, (trx, info) in enumerate(paired_transactions):
+                if not info:
+                    logger.warning("No transaction info found for TxID %s in block %d", self.__calc_trxID(trx), block_num)
+                    flag_for_rerun(block_num)
                     continue
+                
+                owner_address = None
+                match trx.raw_data.contract[0].type:
+                    case protocol.Transaction.Contract.ContractType.TriggerSmartContract:
+                        msg = smart_contract_pb2.TriggerSmartContract()
+                        trx.raw_data.contract[0].parameter.Unpack(msg)
+                        owner_address = msg.owner_address
+                        pass
+                    case protocol.Transaction.Contract.ContractType.TransferContract:
+                        pass
+                    case protocol.Transaction.Contract.ContractType.TransferAssetContract:
+                        pass
+                    case protocol.Transaction.Contract.ContractType.CustomContract:
+                        pass
+                    case _:
+                        # logger.warning("Unhandled transaction type %s in block %d", protocol.Transaction.Contract.ContractType.Name(trx.raw_data.contract[0].type), block_num)
+                        continue
 
-            transaction = self.__trx_to_model(block, trx, info, i)
-            transactions.append(transaction)
+                transaction = self.__trx_to_model(block, trx, info, i)
+                transactions.append(transaction)
 
-            i = 0
-            if info.internal_transactions:
-                for internal_trx in info.internal_transactions:
-                    for call_info in internal_trx.callValueInfo:
-                        transfers.append(self.__call_info_to_model(transaction.id, block, trx, owner_address, internal_trx, call_info, i))
-                        i += 1
+                i = 0
+                if info.internal_transactions:
+                    for internal_trx in info.internal_transactions:
+                        for call_info in internal_trx.callValueInfo:
+                            transfers.append(self.__call_info_to_model(transaction.id, block, trx, owner_address, internal_trx, call_info, i))
+                            i += 1
 
-            if info.log:
-                pass
+                if info.log:
+                    pass
 
-        try:
-            cur = self.conn.cursor()
+        with timed("db.inserts.transactions"):
             cur.executemany("INSERT INTO transactions (id, block, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING", [tx.as_params() for tx in transactions])
+        with timed("db.inserts.transfers"):
             cur.executemany("CALL insert_transfer(%s, %s, %s, %s, %s, %s, %s, %s, %s)", transfers)
-            self.conn.commit()
-        except Exception as e:
-            print(f"Error inserting transactions for block {block_num}: {e}")
-            flag_for_rerun(block_num)
-            return None
+        
+        logger.debug(f"Block {block_num}: {len(transactions)} transactions, {len(transfers)} transfers")
 
         return block, infos
     
-    def handle_range(self, start: int, end: int):
-        print(f"Handling blocks {start} to {end}")
+    def handle_range(self, start: int, end: int, logger: logging.Logger):
         for block_num in range(start, end + 1):
-            self.handle_block(block_num)
-        pass
+            cur = self.conn.cursor()
+            try:
+                self.handle_block(block_num, cur, logger)
+                self.conn.commit()
+            except grpc.RpcError as e:
+                self.conn.rollback()
+                logger.exception("gRPC error while processing block %d", block_num)
+                flag_for_rerun(list(range(block_num, end + 1)))
+                raise e
+            except Exception as e:
+                self.conn.rollback()
+                logger.exception("Failed to process block %d", block_num)
+                flag_for_rerun(block_num)
+        logger.info(f"Finished")
