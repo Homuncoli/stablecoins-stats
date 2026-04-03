@@ -40,6 +40,22 @@ import time
 transaction_queue = queue.Queue()
 transfer_queue = queue.Queue()
 
+
+class BlockDataError(Exception):
+    """Raised when a single block contains malformed or incomplete data."""
+
+
+class ChunkRetryError(Exception):
+    """Raised when a transient RPC issue requires reprocessing the remaining chunk."""
+
+    def __init__(self, failed_block: int, chunk_end: int, cause: Exception):
+        self.failed_block = failed_block
+        self.chunk_end = chunk_end
+        self.cause = cause
+        super().__init__(
+            f"Transient RPC failure at block {failed_block}; retry chunk through {chunk_end}: {cause}"
+        )
+
 @dataclass
 class Address:
     id: int
@@ -287,6 +303,13 @@ class TronGRpcScraper(NodeScraper):
         return block, infos
     
     def handle_range(self, start: int, end: int, logger: logging.Logger):
+        transient_rpc_codes = {
+            grpc.StatusCode.UNAVAILABLE,
+            grpc.StatusCode.DEADLINE_EXCEEDED,
+            grpc.StatusCode.CANCELLED,
+            grpc.StatusCode.RESOURCE_EXHAUSTED,
+        }
+
         for block_num in range(start, end + 1):
             cur = self.conn.cursor()
             try:
@@ -294,12 +317,25 @@ class TronGRpcScraper(NodeScraper):
                 self.conn.commit()
             except grpc.RpcError as e:
                 self.conn.rollback()
-                logger.exception("gRPC error while processing block %d", block_num)
-                flag_for_rerun(list(range(block_num, end + 1)))
-                raise e
+                status = e.code() if hasattr(e, "code") else Nonep
+                if status in transient_rpc_codes:
+                    logger.warning(
+                        "Transient gRPC error while processing block %d (%s); scheduling chunk retry",
+                        block_num,
+                        status,
+                    )
+                    flag_for_rerun(list(range(block_num, end + 1)))
+                    raise ChunkRetryError(block_num, end, e) from e
+
+                logger.exception("Non-transient gRPC error while processing block %d", block_num)
+                flag_for_rerun(block_num)
+            except (KeyError, ValueError, TypeError, AttributeError, IndexError) as e:
+                self.conn.rollback()
+                logger.warning("Malformed/incomplete block %d: %s", block_num, e)
+                flag_for_rerun(block_num)
             except Exception as e:
                 self.conn.rollback()
-                logger.exception("Failed to process block %d", block_num)
+                logger.exception("Unexpected block-level error for block %d", block_num)
                 flag_for_rerun(block_num)
         logger.info(f"Finished")
 
@@ -314,6 +350,7 @@ def transaction_consumer(
     stage_commit_batch_size: int = 2_000_000,
     queue_timeout: int = 20,
     sync_commit: bool = False,
+    metrics_interval_s: int = 30,
 ):
     written = 0
     consumer_logger = logging.getLogger(__name__)
@@ -322,6 +359,29 @@ def transaction_consumer(
     staged_since_commit = 0
     staging_table = f"transactions_stage_{consumer_id}_{os.getpid()}"
     staging_table = re.sub(r"[^a-zA-Z0-9_]", "_", staging_table)
+    metrics_interval_s = max(1, metrics_interval_s)
+    metrics_last_t = time.monotonic()
+    metrics_last_written = 0
+
+    def log_metrics(force: bool = False):
+        nonlocal metrics_last_t, metrics_last_written
+        now = time.monotonic()
+        if (not force) and (now - metrics_last_t < metrics_interval_s):
+            return
+        interval = max(now - metrics_last_t, 1e-6)
+        delta_written = written - metrics_last_written
+        consumer_logger.info(
+            "tx_consumer[%d] written=%d (+%d, %.1f/s), staged=%d, buffered=%d, qsize=%d",
+            consumer_id,
+            written,
+            delta_written,
+            delta_written / interval,
+            staged_rows,
+            len(buffered_rows),
+            transaction_queue.qsize(),
+        )
+        metrics_last_t = now
+        metrics_last_written = written
 
     def copy_into_staging(cur: psycopg.Cursor) -> int:
         if not buffered_rows:
@@ -354,6 +414,7 @@ def transaction_consumer(
                 FROM {staging_table} s
                 LEFT JOIN transactions t ON t.id = s.id
                 WHERE t.id IS NULL
+                ON CONFLICT (id) DO NOTHING
                 """
             )
         else:
@@ -409,6 +470,7 @@ def transaction_consumer(
                             if inserted:
                                 written += inserted
                             conn.commit()
+                            log_metrics(force=True)
                             break
                         if stop_event is None:
                             copied = copy_into_staging(cur)
@@ -418,6 +480,7 @@ def transaction_consumer(
                             if inserted:
                                 written += inserted
                             conn.commit()
+                            log_metrics(force=True)
                             break
 
                         copied = copy_into_staging(cur)
@@ -432,6 +495,7 @@ def transaction_consumer(
                                 written += inserted
                             conn.commit()
                             staged_since_commit = 0
+                        log_metrics()
                         continue
 
                     try:
@@ -444,6 +508,7 @@ def transaction_consumer(
                             if inserted:
                                 written += inserted
                             conn.commit()
+                            log_metrics(force=True)
                             break
 
                         buffered_rows.append(tx)
@@ -460,6 +525,7 @@ def transaction_consumer(
                                 written += inserted
                                 conn.commit()
                                 staged_since_commit = 0
+                        log_metrics()
                     finally:
                         transaction_queue.task_done()
     except KeyboardInterrupt:
@@ -474,4 +540,287 @@ def transaction_consumer(
                 cleanup_conn.commit()
         except Exception:
             consumer_logger.debug("failed to drop staging table %s", staging_table, exc_info=True)
+        log_metrics(force=True)
         consumer_logger.info("transaction_consumer stopped after writing %d rows to postgres", written)
+
+
+def transfer_consumer(
+    pg_dsn: str,
+    consumer_id: int = 0,
+    stop_event: threading.Event | None = None,
+    batch_size: int = 100_000,
+    merge_batch_size: int = 1_000_000,
+    merge_on_shutdown_only: bool = False,
+    stage_commit_batch_size: int = 2_000_000,
+    queue_timeout: int = 20,
+    sync_commit: bool = False,
+    metrics_interval_s: int = 30,
+):
+    written = 0
+    consumer_logger = logging.getLogger(__name__)
+    buffered_rows: list[tuple] = []
+    staged_rows = 0
+    staged_since_commit = 0
+    staging_table = f"transfers_stage_{consumer_id}_{os.getpid()}"
+    staging_table = re.sub(r"[^a-zA-Z0-9_]", "_", staging_table)
+    metrics_interval_s = max(1, metrics_interval_s)
+    metrics_last_t = time.monotonic()
+    metrics_last_written = 0
+
+    def log_metrics(force: bool = False):
+        nonlocal metrics_last_t, metrics_last_written
+        now = time.monotonic()
+        if (not force) and (now - metrics_last_t < metrics_interval_s):
+            return
+        interval = max(now - metrics_last_t, 1e-6)
+        delta_written = written - metrics_last_written
+        consumer_logger.info(
+            "transfer_consumer[%d] written=%d (+%d, %.1f/s), staged=%d, buffered=%d, qsize=%d",
+            consumer_id,
+            written,
+            delta_written,
+            delta_written / interval,
+            staged_rows,
+            len(buffered_rows),
+            transfer_queue.qsize(),
+        )
+        metrics_last_t = now
+        metrics_last_written = written
+
+    def copy_into_staging(cur: psycopg.Cursor) -> int:
+        if not buffered_rows:
+            return 0
+
+        with cur.copy(
+            f"""
+            COPY {staging_table}
+            (tx_id, transfer_index, transfer_t, asset_id, contract_addr, value, from_addr, to_addr, rejected)
+            FROM STDIN
+            """
+        ) as copy:
+            for row in buffered_rows:
+                copy.write_row(row)
+
+        copied = len(buffered_rows)
+        buffered_rows.clear()
+        return copied
+
+    def merge_staging(cur: psycopg.Cursor) -> tuple[int, int]:
+        nonlocal staged_rows
+        if staged_rows == 0:
+            return 0, 0
+
+        cur.execute(
+            f"""
+            INSERT INTO addresses (addr, addr_t)
+            SELECT DISTINCT s.from_addr, 'EOA'::addr_type
+            FROM {staging_table} s
+            WHERE s.from_addr IS NOT NULL
+            ON CONFLICT (addr) DO NOTHING
+            """
+        )
+        cur.execute(
+            f"""
+            INSERT INTO addresses (addr, addr_t)
+            SELECT DISTINCT s.to_addr, 'EOA'::addr_type
+            FROM {staging_table} s
+            WHERE s.to_addr IS NOT NULL
+            ON CONFLICT (addr) DO NOTHING
+            """
+        )
+        cur.execute(
+            f"""
+            INSERT INTO addresses (addr, addr_t)
+            SELECT DISTINCT s.contract_addr, 'Contract'::addr_type
+            FROM {staging_table} s
+            WHERE s.contract_addr IS NOT NULL
+            ON CONFLICT (addr) DO NOTHING
+            """
+        )
+
+        cur.execute(
+            f"""
+            INSERT INTO token (asset_name, contract_addr, token_t)
+            SELECT DISTINCT s.asset_id, NULL::integer, 'TRC10'::token_type
+            FROM {staging_table} s
+            WHERE s.asset_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM token t
+                  WHERE t.asset_name = s.asset_id
+              )
+            """
+        )
+        cur.execute(
+            f"""
+            INSERT INTO token (asset_name, contract_addr, token_t)
+            SELECT DISTINCT NULL::bytea, a.id, 'TRC20'::token_type
+            FROM {staging_table} s
+            JOIN addresses a ON a.addr = s.contract_addr
+            WHERE s.contract_addr IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM token t
+                  WHERE t.contract_addr = a.id
+              )
+            """
+        )
+
+        cur.execute(
+            f"""
+            WITH resolved AS (
+                SELECT
+                    s.tx_id,
+                    s.transfer_index,
+                    s.transfer_t,
+                    COALESCE(t20.id, t10.id, 0) AS token_id,
+                    s.value,
+                    to_a.id AS to_addr_id,
+                    from_a.id AS from_addr_id,
+                    s.rejected
+                FROM {staging_table} s
+                JOIN transactions tx ON tx.id = s.tx_id
+                JOIN addresses from_a ON from_a.addr = s.from_addr
+                JOIN addresses to_a ON to_a.addr = s.to_addr
+                LEFT JOIN addresses c_a ON c_a.addr = s.contract_addr
+                LEFT JOIN token t20
+                    ON s.contract_addr IS NOT NULL
+                    AND t20.contract_addr = c_a.id
+                LEFT JOIN token t10
+                    ON s.contract_addr IS NULL
+                    AND s.asset_id IS NOT NULL
+                    AND t10.asset_name = s.asset_id
+            )
+                    INSERT INTO transfers ("transaction", index, transfer_t, token, value, to_addr, from_addr, rejected)
+            SELECT
+                r.tx_id,
+                r.transfer_index,
+                r.transfer_t,
+                r.token_id,
+                r.value,
+                r.to_addr_id,
+                r.from_addr_id,
+                r.rejected
+            FROM resolved r
+            ON CONFLICT DO NOTHING
+            """
+        )
+        inserted = cur.rowcount
+
+        cur.execute(
+            f"""
+            DELETE FROM {staging_table} s
+            USING transactions tx
+            WHERE tx.id = s.tx_id
+            """
+        )
+        processed = cur.rowcount
+        staged_rows -= processed
+        return inserted, processed
+
+    try:
+        with psycopg.connect(pg_dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    DROP TABLE IF EXISTS {staging_table};
+                    CREATE UNLOGGED TABLE {staging_table} (
+                        tx_id bigint,
+                        transfer_index smallint,
+                        transfer_t transfer_type,
+                        asset_id bytea,
+                        contract_addr bytea,
+                        value bigint,
+                        from_addr bytea,
+                        to_addr bytea,
+                        rejected bool
+                    )
+                    """
+                )
+                cur.execute(f"CREATE INDEX {staging_table}_tx_id_idx ON {staging_table}(tx_id)")
+                conn.commit()
+
+                if not sync_commit:
+                    cur.execute("SET synchronous_commit TO OFF")
+
+                while True:
+                    try:
+                        transfer = transfer_queue.get(timeout=queue_timeout)
+                    except queue.Empty:
+                        if stop_event is not None and stop_event.is_set() and transfer_queue.empty():
+                            copied = copy_into_staging(cur)
+                            staged_rows += copied
+                            staged_since_commit += copied
+                            inserted, _ = merge_staging(cur)
+                            if inserted:
+                                written += inserted
+                            conn.commit()
+                            log_metrics(force=True)
+                            break
+                        if stop_event is None:
+                            copied = copy_into_staging(cur)
+                            staged_rows += copied
+                            staged_since_commit += copied
+                            inserted, _ = merge_staging(cur)
+                            if inserted:
+                                written += inserted
+                            conn.commit()
+                            log_metrics(force=True)
+                            break
+
+                        copied = copy_into_staging(cur)
+                        staged_rows += copied
+                        staged_since_commit += copied
+                        if staged_since_commit >= stage_commit_batch_size:
+                            conn.commit()
+                            staged_since_commit = 0
+                        if (not merge_on_shutdown_only) and staged_rows >= merge_batch_size:
+                            inserted, _ = merge_staging(cur)
+                            if inserted:
+                                written += inserted
+                            conn.commit()
+                            staged_since_commit = 0
+                        log_metrics()
+                        continue
+
+                    try:
+                        if transfer is None:
+                            copied = copy_into_staging(cur)
+                            staged_rows += copied
+                            staged_since_commit += copied
+                            inserted, _ = merge_staging(cur)
+                            if inserted:
+                                written += inserted
+                            conn.commit()
+                            log_metrics(force=True)
+                            break
+
+                        buffered_rows.append(transfer)
+
+                        if len(buffered_rows) >= batch_size:
+                            copied = copy_into_staging(cur)
+                            staged_rows += copied
+                            staged_since_commit += copied
+                            if staged_since_commit >= stage_commit_batch_size:
+                                conn.commit()
+                                staged_since_commit = 0
+                            if (not merge_on_shutdown_only) and staged_rows >= merge_batch_size:
+                                inserted, _ = merge_staging(cur)
+                                written += inserted
+                                conn.commit()
+                                staged_since_commit = 0
+                        log_metrics()
+                    finally:
+                        transfer_queue.task_done()
+    except KeyboardInterrupt:
+        consumer_logger.info("transfer_consumer interrupted; shutting down cleanly")
+    except Exception:
+        consumer_logger.exception("transfer_consumer failed")
+    finally:
+        try:
+            with psycopg.connect(pg_dsn) as cleanup_conn:
+                with cleanup_conn.cursor() as cleanup_cur:
+                    cleanup_cur.execute(f"DROP TABLE IF EXISTS {staging_table}")
+                cleanup_conn.commit()
+        except Exception:
+            consumer_logger.debug("failed to drop staging table %s", staging_table, exc_info=True)
+        log_metrics(force=True)
+        consumer_logger.info("transfer_consumer stopped after writing %d rows to postgres", written)
