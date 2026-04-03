@@ -13,14 +13,12 @@ from filelock import FileLock
 
 from constants import TRON_CHAIN_ID
 from scraper import NodeScraper
-from model.Block import Block
-from model.Transaction import Transaction
 
 import base58
 import hashlib
 
 import grpc
-from perf_timing import timed
+from metrics import timed
 
 sys.path.insert(0, os.path.abspath('./tron/generated'))
 sys.path.insert(0, os.path.abspath('./'))
@@ -30,8 +28,6 @@ from tron.generated.core import Tron_pb2 as protocol
 from tron.generated.core.contract import asset_issue_contract_pb2
 from tron.generated.core.contract import balance_contract_pb2
 from tron.generated.core.contract import smart_contract_pb2
-
-VALID_TRANSACTION_TYPES = ['TransferContract', 'TransferAssetContract', 'CustomContract', 'TriggerSmartContract']
 
 import queue
 import threading
@@ -55,65 +51,6 @@ class ChunkRetryError(Exception):
         super().__init__(
             f"Transient RPC failure at block {failed_block}; retry chunk through {chunk_end}: {cause}"
         )
-
-@dataclass
-class Address:
-    id: int
-    address: bytearray
-    addr_t: str # 'EOA', 'Contract'
-
-class Token:
-    id: int
-    address: Address
-    asset_name: str
-    token_t: str # 'TRX', 'TRC10', 'TRC20', 'TRC721'
-
-@dataclass
-class Transaction:
-    id: int
-    block: int
-    result: bool
-    ts: datetime
-    transaction_t: str # 'TransferContract', 'TransferAssetContract', 'CustomContract', 'TriggerSmartContract'
-    fee_limit: int | None
-    fee: int | None
-    energy_usage: int | None
-    net_fee: int | None
-
-    def __post_init__(self):
-        if self.id is None:
-            raise ValueError("Transaction ID cannot be None")
-        if self.transaction_t not in VALID_TRANSACTION_TYPES:
-            raise ValueError(f"Invalid transaction type: {self.transaction_t}")
-
-    def as_params(self):
-        return (self.id, self.block, self.result, self.ts, self.transaction_t, self.fee_limit, self.fee, self.energy_usage, self.net_fee)
-    
-    def __str__(self):
-        return f"Transaction(id={self.id}, block={self.block}, result={self.result}, ts={self.ts}, transaction_t={self.transaction_t}, fee_limit={self.fee_limit}, fee={self.fee}, energy_usage={self.energy_usage}, net_fee={self.net_fee})"
-
-@dataclass
-class Transfer:
-    transaction: Transaction
-    index: int
-    from_addr: Address
-    to_addr: Address
-    contract: Address
-    reject: bool
-    token: Token
-    value: int
-    transfer_t: str # 'Transaction', 'Internal Transaction', 'Log'
-
-@dataclass
-class Logs:
-    transaction: Transaction
-    index: int
-    address: Address
-    topic0: bytearray | None
-    topic1: bytearray | None
-    topic2: bytearray | None
-    topic3: bytearray | None
-    data: bytearray | None
 
 _RERUN_QUEUE_FILE = Path("./.rerun_queue")
 _RERUN_QUEUE_LOCK = FileLock(str(_RERUN_QUEUE_FILE) + ".lock", timeout=10)

@@ -6,9 +6,8 @@ from dataclasses import dataclass
 import threading
 import time
 
-
 @dataclass
-class _Stats:
+class TimingStats:
     total_ns: int = 0
     count: int = 0
     min_ns: int = 0
@@ -19,7 +18,7 @@ class TimingRegistry:
     def __init__(self) -> None:
         self._enabled = False
         self._lock = threading.Lock()
-        self._stats: dict[str, _Stats] = defaultdict(_Stats)
+        self._stats: dict[str, TimingStats] = defaultdict(TimingStats)
 
     def enable(self) -> None:
         self._enabled = True

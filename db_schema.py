@@ -1,7 +1,6 @@
 import psycopg
 from pathlib import Path
 import logging
-from model.Block import Block
 
 CREATE_MIGRATIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS migrations (
