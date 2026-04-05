@@ -11,8 +11,7 @@ def __create_staging_table(cur, staging_table: str):
                     CREATE TEMP TABLE {staging_table} (
                         transaction bigint,
                         index smallint,
-                        transfer_t transfer_type,
-                        token_asset_name bytea,
+                        token_asset_id bigint,
                         token_contract_addr bytea,
                         token_t token_type,
                         value bigint,
@@ -25,7 +24,7 @@ def __create_staging_table(cur, staging_table: str):
                 """)
     
 def __copy_to_staging_table(cur, buffer: list, staging_table: str):
-    with cur.copy(f"COPY {staging_table} (transaction, index, transfer_t, token_asset_name, token_contract_addr, token_t, value, from_addr, from_type, to_addr, to_type, success) FROM STDIN") as copy:
+    with cur.copy(f"COPY {staging_table} (transaction, index, token_asset_id, token_contract_addr, token_t, value, from_addr, from_type, to_addr, to_type, success) FROM STDIN") as copy:
         for record in buffer:
             copy.write_row(record)
 
@@ -49,19 +48,19 @@ def __merge_staging_table(cur, staging_table: str):
                     ON CONFLICT (addr) DO UPDATE SET addr_t = 'Contract'::addr_type
                 """)
     cur.execute(f"""
-                    INSERT INTO tokens (contract_addr, asset_name, token_t)
-                    SELECT DISTINCT a.id, s.token_asset_name, s.token_t FROM {staging_table} s
+                    INSERT INTO tokens (contract_addr, asset_id, token_t)
+                    SELECT DISTINCT a.id, s.token_asset_id, s.token_t FROM {staging_table} s
                         LEFT JOIN addresses a ON s.token_contract_addr = a.addr
                     ON CONFLICT (contract_addr) DO NOTHING
                 """)
     cur.execute(f"""
-                    INSERT INTO transfers (transaction, index, transfer_t, token, value, from_addr, to_addr, success)
-                    SELECT s.transaction, s.index, s.transfer_t, COALESCE(t.id, 0), s.value, from_a.id, to_a.id, s.success
+                    INSERT INTO transfers (transaction, index, token, value, from_addr, to_addr, success)
+                    SELECT s.transaction, s.index, COALESCE(t.id, 0), s.value, from_a.id, to_a.id, s.success
                     FROM {staging_table} s
                     LEFT JOIN addresses from_a ON s.from_addr = from_a.addr
                     LEFT JOIN addresses to_a ON s.to_addr = to_a.addr
                     LEFT JOIN addresses token_a ON s.token_contract_addr = token_a.addr
-                    LEFT JOIN tokens t ON (s.token_contract_addr IS NOT NULL AND token_a.id = t.contract_addr) OR (s.token_asset_name IS NOT NULL AND s.token_asset_name = t.asset_name)
+                    LEFT JOIN tokens t ON (s.token_contract_addr IS NOT NULL AND token_a.id = t.contract_addr) OR (s.token_asset_id IS NOT NULL AND s.token_asset_id = t.asset_id)
                     ON CONFLICT (transaction, index) DO NOTHING
                 """)
 

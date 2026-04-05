@@ -254,7 +254,7 @@ class TronGRpcScraper(NodeScraper):
                 self.conn.commit()
             except grpc.RpcError as e:
                 self.conn.rollback()
-                status = e.code() if hasattr(e, "code") else Nonep
+                status = e.code() if hasattr(e, "code") else None
                 if status in transient_rpc_codes:
                     logger.warning(
                         "Transient gRPC error while processing block %d (%s); scheduling chunk retry",

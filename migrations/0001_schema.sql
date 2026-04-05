@@ -13,10 +13,6 @@ begin
 	if not exists (select 1 from pg_type where typname = 'transaction_type') then
 		create type transaction_type as enum ('TransferContract', 'TransferAssetContract', 'CustomContract', 'TriggerSmartContract');
 	end if;
-
-	if not exists (select 1 from pg_type where typname = 'transfer_type') then
-		create type transfer_type as enum ('Transfer', 'TriggerSmartContract', 'Internal Transaction', 'Log');
-	end if;
 end
 $$;
 
@@ -28,11 +24,11 @@ create table if not exists addresses (
 
 create table if not exists tokens (
 	id bigserial primary key,
-	asset_name bytea unique,
+	asset_id bigint unique,
 	contract_addr bigint unique references addresses(id),
 	token_t token_type not null
 );
-insert into tokens (id, asset_name, contract_addr, token_t) VALUES (0, NULL, NULL, 'TRX') ON CONFLICT DO NOTHING;
+insert into tokens (id, asset_id, contract_addr, token_t) VALUES (0, NULL, NULL, 'TRX') ON CONFLICT DO NOTHING;
 
 create table if not exists transactions (
 	id bigint primary key, -- = block number * 1000 + transaction index in block
@@ -50,7 +46,6 @@ create table if not exists transactions (
 create table if not exists transfers (
 	transaction bigint not null references transactions(id),
 	index smallint not null,
-	transfer_t transfer_type not null,
 	
 	token int not null references tokens(id),
 	value bigint not null,

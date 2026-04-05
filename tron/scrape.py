@@ -43,11 +43,9 @@ def __transfer_contract(block, trx, i, info, transfer, logger: logging.Logger):
         info.receipt.net_fee if info.receipt.net_fee is not None else 0)
     TX_QUEUE.put(tx)
 
-    print(f"{info=}")
     tf : TransferDTO = (
         id,
         0,
-        "Native",
         None,
         None,
         "TRX",
@@ -61,7 +59,35 @@ def __transfer_contract(block, trx, i, info, transfer, logger: logging.Logger):
     TF_QUEUE.put(tf)
 
 def __transfer_asset_contract(block, trx, i, info, transfer_asset, logger: logging.Logger):
-    pass
+    print(f"TransferAssetContract: {transfer_asset=}")
+    id = block.block_header.raw_data.number * SCALER + i % SCALER
+    tx : TransactionDTO =  (
+        id,
+        bool(trx.ret[0].contractRet == protocol.Transaction.Result.SUCCESS),
+        datetime.fromtimestamp(block.block_header.raw_data.timestamp / 1000, tz=timezone.utc),
+        protocol.Transaction.Contract.ContractType.Name(trx.raw_data.contract[0].type),
+        trx.raw_data.fee_limit,
+        info.fee if info.fee is not None else 0,
+        info.receipt.energy_usage if info.receipt.energy_usage is not None else 0,
+        info.receipt.net_fee if info.receipt.net_fee is not None else 0
+    )
+    TX_QUEUE.put(tx)
+
+    tf: TransferDTO = (
+        id,
+        0,
+        int(transfer_asset.asset_name),
+        None,
+        "TRC10",
+        transfer_asset.amount,
+        transfer_asset.owner_address,
+        "EOA",
+        transfer_asset.to_address,
+        "Unknown",
+        bool(trx.ret[0].contractRet == protocol.Transaction.Result.SUCCESS)
+    )
+    TF_QUEUE.put(tf)
+
 
 def __custom_contract(block, trx, i, info, custom, logger: logging.Logger):
     pass
