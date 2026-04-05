@@ -10,7 +10,6 @@ def __create_staging_table(cur, staging_table: str):
     cur.execute(f"""
                     CREATE TEMP TABLE {staging_table} (
                         id bigint,
-                        block bigint,
                         result bool,
                         ts timestamp,
                         transaction_t transaction_type,
@@ -21,14 +20,13 @@ def __create_staging_table(cur, staging_table: str):
                     )
                 """)
     
-def __merge_staging_table(cur, staging_table: str, final_table: str):
+def __merge_staging_table(cur, staging_table: str):
     cur.execute(f"""
-                    INSERT INTO {final_table} (id, block, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee)
-                    SELECT id, block, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee
+                    INSERT INTO transactions (id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee)
+                    SELECT id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee
                     FROM (
                         SELECT DISTINCT ON (id)
                             id,
-                            block,
                             result,
                             ts,
                             transaction_t,
@@ -37,10 +35,9 @@ def __merge_staging_table(cur, staging_table: str, final_table: str):
                             energy_usage,
                             net_fee
                         FROM {staging_table}
-                        ORDER BY id, ts DESC NULLS LAST, block DESC NULLS LAST
+                        ORDER BY id, ts DESC NULLS LAST
                     ) deduped
                     ON CONFLICT (id) DO UPDATE SET
-                        block = EXCLUDED.block,
                         result = EXCLUDED.result,
                         ts = EXCLUDED.ts,
                         transaction_t = EXCLUDED.transaction_t,
@@ -51,13 +48,13 @@ def __merge_staging_table(cur, staging_table: str, final_table: str):
                 """)
 
 def __copy_to_staging_table(cur, buffer: list[TransactionDTO], staging_table: str):
-    with cur.copy(f"COPY {staging_table} (id, block, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee) FROM STDIN") as copy:
+    with cur.copy(f"COPY {staging_table} (id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee) FROM STDIN") as copy:
         for record in buffer:
             copy.write_row(record)
 
-def tx_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Event, timeout: float | None, batch_size: int, metrics: int):
+def tx_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Event, timeout: float | None, commit_size: int, merge_size: int, metrics: int):
     logger = logging.getLogger(f"tx-consumer-{consumer_id}")
-    logger.info("Transaction consumer %d started", consumer_id)
+    logger.info("started")
 
     staging_table = f"tx_staging_{consumer_id}"
 
@@ -67,25 +64,32 @@ def tx_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
             with conn.cursor() as cur:
                 __create_staging_table(cur, staging_table)
 
+                merge_counter = 0
                 while not stop_event.is_set():
                     try:
                         tx = TX_QUEUE.get(timeout=timeout)
                     except Empty:
-                        logging.warning("Transaction consumer %d timed out", consumer_id)
+                        logger.warning("timed out")
                         continue
 
                     buffer.append(tx)
 
-                    if len(buffer) >= batch_size:
-                        logger.info("Transaction consumer %d flushing buffer of size %d", consumer_id, len(buffer))
+                    if len(buffer) >= commit_size:
                         __copy_to_staging_table(cur, buffer, staging_table)
-                        conn.commit()
+                        merge_counter += len(buffer)
                         buffer.clear()
 
-                logger.info("Transaction consumer %d stopping, flushing remaining buffer of size %d", consumer_id, len(buffer))
+                        if merge_counter >= merge_size:
+                            logger.info("merging staging table after processing %d transactions", merge_counter)
+                            __merge_staging_table(cur, staging_table)
+                            conn.commit()
+                            merge_counter = 0
+                        
+
+                logger.info("stopping, flushing remaining buffer of size %d", len(buffer))
                 __copy_to_staging_table(cur, buffer, staging_table)
-                __merge_staging_table(cur, staging_table, "transactions")
+                __merge_staging_table(cur, staging_table)
                 conn.commit()
 
     except Exception as e:
-        logger.fatal("Fatal error in transaction consumer %d", consumer_id, exc_info=e)
+        logger.fatal("Fatal error", exc_info=e)

@@ -30,10 +30,11 @@ def __trigger_smart_contract(block, trx, i, info, smart, logger: logging.Logger)
     pass
 
 def __transfer_contract(block, trx, i, info, transfer, logger: logging.Logger):
+    id = block.block_header.raw_data.number * SCALER + i % SCALER
+
     tx : TransactionDTO =  (
-        block.block_header.raw_data.number * SCALER + i % SCALER,
-        block.block_header.raw_data.number,
-        bool(info.receipt.result),
+        id,
+        bool(trx.ret[0].contractRet == protocol.Transaction.Result.SUCCESS),
         datetime.fromtimestamp(block.block_header.raw_data.timestamp / 1000, tz=timezone.utc),
         protocol.Transaction.Contract.ContractType.Name(trx.raw_data.contract[0].type),
         trx.raw_data.fee_limit,
@@ -42,17 +43,20 @@ def __transfer_contract(block, trx, i, info, transfer, logger: logging.Logger):
         info.receipt.net_fee if info.receipt.net_fee is not None else 0)
     TX_QUEUE.put(tx)
 
+    print(f"{info=}")
     tf : TransferDTO = (
-        block.block_header.raw_data.number * SCALER + i % SCALER,
+        id,
         0,
-        "Transfer",
+        "Native",
         None,
         None,
         "TRX",
         transfer.amount,
         transfer.owner_address,
+        "EOA",
         transfer.to_address,
-        bool(info.receipt.result)
+        "Unknown",
+        bool(trx.ret[0].contractRet == protocol.Transaction.Result.SUCCESS)
     )
     TF_QUEUE.put(tf)
 
@@ -123,5 +127,5 @@ def scrape(stub: tron_api.WalletStub, chunk_id: int, chunk_start: int, chunk_end
                 logger.info("stopped")
                 break
     except Exception as e:
-        logger.fatal("Fatal error in RPC scraper at block %d (%d skipped): %s", block, chunk_end - current, exc_info=e)
+        logger.fatal("fatal error in RPC scraper at block %d (%d skipped): %s", block, chunk_end - current, exc_info=e)
         raise

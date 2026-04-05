@@ -10,29 +10,64 @@ def __create_staging_table(cur, staging_table: str):
     cur.execute(f"""
                     CREATE TEMP TABLE {staging_table} (
                         transaction bigint,
-                        idx int,
-                        transfer_type transfer_type,
+                        index smallint,
+                        transfer_t transfer_type,
                         token_asset_name bytea,
                         token_contract_addr bytea,
-                        token_type text,
+                        token_t token_type,
                         value bigint,
                         from_addr bytea,
+                        from_type addr_type,
                         to_addr bytea,
+                        to_type addr_type,
                         success bool
                     )
                 """)
     
 def __copy_to_staging_table(cur, buffer: list, staging_table: str):
-    with cur.copy(f"COPY {staging_table} (transaction, idx, transfer_type, token_asset_name, token_contract_addr, token_type, value, from_addr, to_addr, success) FROM STDIN") as copy:
+    with cur.copy(f"COPY {staging_table} (transaction, index, transfer_t, token_asset_name, token_contract_addr, token_t, value, from_addr, from_type, to_addr, to_type, success) FROM STDIN") as copy:
         for record in buffer:
             copy.write_row(record)
 
-def __merge_staging_table(cur, staging_table: str, final_table: str):
-    pass
+def __merge_staging_table(cur, staging_table: str):
+    cur.execute(f"""
+                    INSERT INTO addresses (addr, addr_t)
+                    SELECT DISTINCT s.from_addr, s.from_type FROM {staging_table} s
+                                        WHERE s.from_addr IS NOT NULL
+                    ON CONFLICT (addr) DO NOTHING
+                """)
+    cur.execute(f"""
+                    INSERT INTO addresses (addr, addr_t)
+                    SELECT DISTINCT s.to_addr, s.to_type FROM {staging_table} s
+                                        WHERE s.to_addr IS NOT NULL
+                    ON CONFLICT (addr) DO NOTHING
+                """)
+    cur.execute(f"""
+                    INSERT INTO addresses (addr, addr_t)
+                    SELECT DISTINCT s.token_contract_addr, 'Contract'::addr_type FROM {staging_table} s
+                                        WHERE s.token_contract_addr IS NOT NULL
+                    ON CONFLICT (addr) DO UPDATE SET addr_t = 'Contract'::addr_type
+                """)
+    cur.execute(f"""
+                    INSERT INTO tokens (contract_addr, asset_name, token_t)
+                    SELECT DISTINCT a.id, s.token_asset_name, s.token_t FROM {staging_table} s
+                        LEFT JOIN addresses a ON s.token_contract_addr = a.addr
+                    ON CONFLICT (contract_addr) DO NOTHING
+                """)
+    cur.execute(f"""
+                    INSERT INTO transfers (transaction, index, transfer_t, token, value, from_addr, to_addr, success)
+                    SELECT s.transaction, s.index, s.transfer_t, COALESCE(t.id, 0), s.value, from_a.id, to_a.id, s.success
+                    FROM {staging_table} s
+                    LEFT JOIN addresses from_a ON s.from_addr = from_a.addr
+                    LEFT JOIN addresses to_a ON s.to_addr = to_a.addr
+                    LEFT JOIN addresses token_a ON s.token_contract_addr = token_a.addr
+                    LEFT JOIN tokens t ON (s.token_contract_addr IS NOT NULL AND token_a.id = t.contract_addr) OR (s.token_asset_name IS NOT NULL AND s.token_asset_name = t.asset_name)
+                    ON CONFLICT (transaction, index) DO NOTHING
+                """)
 
-def tf_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Event, timeout: float | None, batch_size: int, metrics: int):
+def tf_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Event, timeout: float | None, commit_size: int, merge_size: int, metrics: int):
     logger = logging.getLogger(f"tf-consumer-{consumer_id}")
-    logger.info("Transfer consumer %d started", consumer_id)
+    logger.info("started")
 
     buffer = []
     staging_table = f"tf_staging_{consumer_id}"
@@ -42,25 +77,33 @@ def tf_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
             with conn.cursor() as cur:
                 __create_staging_table(cur, staging_table)
 
+                merge_count = 0
+
                 while not stop_event.is_set():
                     try:
                         tx = TF_QUEUE.get(timeout=timeout)
                     except Empty:
-                        logging.warning("Transfer consumer %d timed out", consumer_id)
+                        logger.warning("timed out")
                         continue
 
                     buffer.append(tx)
 
-                    if len(buffer) >= batch_size:
-                        logger.info("Transfer consumer %d flushing buffer of size %d", consumer_id, len(buffer))
+                    if len(buffer) >= commit_size:
+                        logger.debug("flushing buffer of size %d", len(buffer))
                         __copy_to_staging_table(cur, buffer, staging_table)
-                        conn.commit()
+                        merge_count += len(buffer)
                         buffer.clear()
 
-                logger.info("Transfer consumer %d stopping, flushing remaining buffer of size %d", consumer_id, len(buffer))
+                        if merge_count >= merge_size:
+                            logger.info("merging staging table after processing %d transfers", merge_count)
+                            __merge_staging_table(cur, staging_table)
+                            conn.commit()
+                            merge_count = 0
+
+                logger.info("stopping, flushing remaining buffer of size %d", len(buffer))
                 __copy_to_staging_table(cur, buffer, staging_table)
-                __merge_staging_table(cur, staging_table, "transfers")
+                __merge_staging_table(cur, staging_table)
                 conn.commit()
 
     except Exception as e:
-        logger.fatal("Fatal error in transfer consumer %d", consumer_id, exc_info=e)
+        logger.fatal("Fatal error", exc_info=e)

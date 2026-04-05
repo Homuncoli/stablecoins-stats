@@ -6,10 +6,10 @@ import queue
 type TokenType = str # 'TRX', 'TRC10', 'TRC20', 'TRC721'
 type TransactionType = str # 'TransferContract', 'TransferAssetContract', etc.
 type TransferType = str # 'Internal', 'Native'
-# block, index, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee
-type TransactionDTO = tuple[int, int, bool, datetime, TransactionType, int, int, int, int]
-# transaction, index, transfer_type, token_asset_name, token_contract_addr, token_type, value, from_addr, to_addr, success 
-type TransferDTO = tuple[int, int, TransferType, bytes, bytes, TokenType, int, bytes, bytes, bool] 
+# id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee
+type TransactionDTO = tuple[int, bool, datetime, TransactionType, int, int, int, int]
+# transaction, index, transfer_type, token_asset_name, token_contract_addr, token_type, value, from_addr, from_type, to_addr, to_type, success 
+type TransferDTO = tuple[int, int, TransferType, bytes, bytes, TokenType, int, bytes, str, bytes, str, bool] 
 
 TX_QUEUE = queue.Queue[TransactionDTO]()
 TF_QUEUE = queue.Queue[TransferDTO]()

@@ -3,7 +3,7 @@ begin;
 do $$
 begin
 	if not exists (select 1 from pg_type where typname = 'addr_type') then
-		create type addr_type as enum ('EOA', 'Contract');
+		create type addr_type as enum ('EOA', 'Contract', 'Unknown');
 	end if;
 
 	if not exists (select 1 from pg_type where typname = 'token_type') then
@@ -26,18 +26,17 @@ create table if not exists addresses (
 	addr_t addr_type not null
 );
 
-create table if not exists token (
+create table if not exists tokens (
 	id bigserial primary key,
 	asset_name bytea unique,
 	contract_addr bigint unique references addresses(id),
 	token_t token_type not null
 );
-insert into token (id, asset_name, contract_addr, token_t) VALUES (0, NULL, NULL, 'TRX') ON CONFLICT DO NOTHING;
+insert into tokens (id, asset_name, contract_addr, token_t) VALUES (0, NULL, NULL, 'TRX') ON CONFLICT DO NOTHING;
 
 create table if not exists transactions (
 	id bigint primary key, -- = block number * 1000 + transaction index in block
 
-	block bigint not null,
 	result bool,
 	ts timestamp not null,
 	transaction_t transaction_type not null,
@@ -53,11 +52,11 @@ create table if not exists transfers (
 	index smallint not null,
 	transfer_t transfer_type not null,
 	
-	token int not null references token(id),
+	token int not null references tokens(id),
 	value bigint not null,
-	to_addr bigint not null references addresses(id),
 	from_addr bigint not null references addresses(id),
-	rejected bool,
+	to_addr bigint not null references addresses(id),
+	success bool,
 	
 	primary key (transaction, index)
 );

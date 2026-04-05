@@ -108,7 +108,8 @@ if __name__ == "__main__":
                     "timeout": TIMEOUT,
                     "consumer_id": i,
                     "stop_event": tx_consumer_stop_event,
-                    "batch_size": args.tx_copy_batch_size,
+                    "commit_size": args.tx_copy_batch_size,
+                    "merge_size": args.tx_merge_batch_size,
                     "metrics": args.metrics
                 },
                 name=f"tx-consumer-{i}"
@@ -125,7 +126,8 @@ if __name__ == "__main__":
                         "timeout": TIMEOUT,
                         "consumer_id": i,
                         "stop_event": tf_consumer_stop_event,
-                        "batch_size": args.tf_copy_batch_size,
+                        "commit_size": args.tf_copy_batch_size,
+                        "merge_size": args.tf_merge_batch_size,
                         "metrics": args.metrics
                     },
                     name=f"tf-consumer-{i}"
