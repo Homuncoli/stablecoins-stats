@@ -14,7 +14,8 @@ def __create_staging_table(cur, staging_table: str):
                         token_asset_id bigint,
                         token_contract_addr bytea,
                         token_t token_type,
-                        value bigint,
+                        value_lo bigint,
+                        value_hi bigint,
                         from_addr bytea,
                         from_type addr_type,
                         to_addr bytea,
@@ -24,7 +25,7 @@ def __create_staging_table(cur, staging_table: str):
                 """)
     
 def __copy_to_staging_table(cur, buffer: list, staging_table: str):
-    with cur.copy(f"COPY {staging_table} (transaction, index, token_asset_id, token_contract_addr, token_t, value, from_addr, from_type, to_addr, to_type, success) FROM STDIN") as copy:
+    with cur.copy(f"COPY {staging_table} (transaction, index, token_asset_id, token_contract_addr, token_t, value_lo, value_hi, from_addr, from_type, to_addr, to_type, success) FROM STDIN") as copy:
         for record in buffer:
             copy.write_row(record)
 
@@ -51,11 +52,11 @@ def __merge_staging_table(cur, staging_table: str):
                     INSERT INTO tokens (contract_addr, asset_id, token_t)
                     SELECT DISTINCT a.id, s.token_asset_id, s.token_t FROM {staging_table} s
                         LEFT JOIN addresses a ON s.token_contract_addr = a.addr
-                    ON CONFLICT (contract_addr) DO NOTHING
+                    ON CONFLICT DO NOTHING
                 """)
     cur.execute(f"""
-                    INSERT INTO transfers (transaction, index, token, value, from_addr, to_addr, success)
-                    SELECT s.transaction, s.index, COALESCE(t.id, 0), s.value, from_a.id, to_a.id, s.success
+                    INSERT INTO transfers (transaction, index, token, value_lo, value_hi, from_addr, to_addr, success)
+                    SELECT s.transaction, s.index, COALESCE(t.id, 0), s.value_lo, s.value_hi, from_a.id, to_a.id, s.success
                     FROM {staging_table} s
                     LEFT JOIN addresses from_a ON s.from_addr = from_a.addr
                     LEFT JOIN addresses to_a ON s.to_addr = to_a.addr

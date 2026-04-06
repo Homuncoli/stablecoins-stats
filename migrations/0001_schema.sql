@@ -48,7 +48,8 @@ create table if not exists transfers (
 	index smallint not null,
 	
 	token int not null references tokens(id),
-	value bigint not null,
+	value_lo bigint not null,
+	value_hi bigint not null,
 	from_addr bigint not null references addresses(id),
 	to_addr bigint not null references addresses(id),
 	success bool,
