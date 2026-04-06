@@ -13,3 +13,4 @@ venv/
 .failed_chunks.txt
 .rerun_queue
 benchmark.ps1
+start.ps1
