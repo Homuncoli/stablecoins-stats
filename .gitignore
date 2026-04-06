@@ -12,3 +12,4 @@ address_types.json
 venv/
 .failed_chunks.txt
 .rerun_queue
+benchmark.ps1

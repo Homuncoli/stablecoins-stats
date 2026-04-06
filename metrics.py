@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
+import logging
 import threading
 import time
 
@@ -16,28 +17,14 @@ class TimingStats:
 
 class TimingRegistry:
     def __init__(self) -> None:
-        self._enabled = False
         self._lock = threading.Lock()
         self._stats: dict[str, TimingStats] = defaultdict(TimingStats)
-
-    def enable(self) -> None:
-        self._enabled = True
-
-    def disable(self) -> None:
-        self._enabled = False
-
-    @property
-    def enabled(self) -> bool:
-        return self._enabled
 
     def clear(self) -> None:
         with self._lock:
             self._stats.clear()
 
     def record(self, name: str, duration_ns: int) -> None:
-        if not self._enabled:
-            return
-
         with self._lock:
             s = self._stats[name]
             s.total_ns += duration_ns
@@ -103,12 +90,15 @@ class TimingRegistry:
         return lines
 
 
-TIMING = TimingRegistry()
+TIMING_ENABLED = True
+TIMING = {
+    "default": TimingRegistry()
+}
 
 
 @contextmanager
-def timed(name: str):
-    if not TIMING.enabled:
+def timed(name: str, space: str = "default"):
+    if not TIMING_ENABLED:
         yield
         return
 
@@ -116,4 +106,12 @@ def timed(name: str):
     try:
         yield
     finally:
-        TIMING.record(name, time.perf_counter_ns() - start)
+        if space not in TIMING:
+            TIMING[space] = TimingRegistry()
+        TIMING[space].record(name, time.perf_counter_ns() - start)
+
+def log_timings():
+    if TIMING_ENABLED:
+        for space, registry in TIMING.items():
+            for line in registry.report_lines():
+                logging.info("%s [%s]", line, space)

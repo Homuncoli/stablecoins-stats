@@ -261,7 +261,7 @@ def __scrape_block(stub: tron_api.WalletStub, block_num: int, logger: logging.Lo
     infos = None
     
     try:
-        with timed("scraper.rpc"):
+        with timed("rpc", "rpc"):
             block = stub.GetBlockByNum(api.NumberMessage(num=block_num))
             infos = stub.GetTransactionInfoByBlockNum(api.NumberMessage(num=block_num))
     except grpc.RpcError as e:
@@ -271,10 +271,10 @@ def __scrape_block(stub: tron_api.WalletStub, block_num: int, logger: logging.Lo
     try:
         paired = None
 
-        with timed("scraper.pairing"):
+        with timed("pairing", "rpc"):
             paired = __pair_transactions_with_infos(block, infos)
 
-        with timed("scraper.processing"):
+        with timed("processing", "rpc"):
             for i, (trx, info) in enumerate(paired):
                 tx, tfs = __parse_transaction(block, trx, i, info, logger)
                 if tx is not None and tfs is not None:

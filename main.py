@@ -18,7 +18,7 @@ import threading
 from concurrent.futures import wait, FIRST_COMPLETED
 
 import grpc
-from metrics import TIMING
+from metrics import TIMING, log_timings
 from model.Tron import TRON_QUEUE
 from tron import scrape as tron
 from tron.db_consumer import db_consumer
@@ -48,15 +48,14 @@ def get_chunks(STUB, start: int, end: int, chunk_size: int) -> list[tuple[int, i
 def monitor_metrics(stop_event: threading.Event, args, rpc_futures: list, interval: int):
     logger = logging.getLogger("metrics-monitor")
     with logging_redirect_tqdm():
-        with tqdm(total=args.chunk_size * len(rpc_futures), unit="blocks", desc="Scraped blocks") as pbar:
+        with tqdm(total=args.chunk_size * len(rpc_futures), unit="blocks", desc="Scraped") as pbar:
             last_done = 0
             while not stop_event.is_set():
                 done = sum(1 for future in rpc_futures if future.done()) * args.chunk_size
                 
                 pbar.update(done - last_done)
                 pbar.set_postfix({
-                    "queue": TRON_QUEUE.qsize(),
-                    "pending": sum(args.chunk_size for future in rpc_futures if not future.done())
+                    "queue": TRON_QUEUE.qsize()
                 })
 
                 last_done = done
@@ -68,11 +67,10 @@ def monitor_metrics(stop_event: threading.Event, args, rpc_futures: list, interv
                 
             pbar.update(done - last_done)
             pbar.set_postfix({
-                "queue": TRON_QUEUE.qsize(),
-                "pending": sum(args.chunk_size for future in rpc_futures if not future.done())
+                "queue": TRON_QUEUE.qsize()
             })
         
-        with tqdm(total=TRON_QUEUE.qsize(), unit="transactions", desc="Processed transactions") as pbar:
+        with tqdm(total=TRON_QUEUE.qsize(), unit="transactions", desc="Backlog") as pbar:
             last_queue_size = TRON_QUEUE.qsize()
             while not stop_event.is_set() or not TRON_QUEUE.empty():
                 queue_size = TRON_QUEUE.qsize()
@@ -84,6 +82,10 @@ def monitor_metrics(stop_event: threading.Event, args, rpc_futures: list, interv
 
                 last_queue_size = queue_size
                 time.sleep(interval)
+            pbar.update(last_queue_size - TRON_QUEUE.qsize())
+            pbar.set_postfix({
+                "pending": TRON_QUEUE.qsize()
+            })
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -107,8 +109,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=getattr(logging, args.debug.upper()), format='%(asctime)s - %(name)s - %(levelname)s: %(message)s')
 
     if args.profile_timing:
-        TIMING.clear()
-        TIMING.enable()
+        TIMING_ENABLED = True
 
     if not args.rpc:
         raise SystemExit("Missing --rpc or RPC_URL")
@@ -131,7 +132,7 @@ if __name__ == "__main__":
     if args.chunk_size is None:
         args.chunk_size = (args.end - args.start) // args.rpc_workers + 1
 
-    logging.info("Scraping %d blocks from %d to %d with chunk size %d => %d RPC workers, %d DB consumers", args.end - args.start + 1, args.start, args.end, args.chunk_size, args.rpc_workers, args.db_consumers)
+    logging.info("Scraping %d blocks (from %d to %d) in %d chunks with chunk size %d => %d RPC workers, %d DB consumers", args.end - args.start + 1, args.start, args.end, (args.end - args.start + 1) // args.chunk_size, args.chunk_size, args.rpc_workers, args.db_consumers)
 
     chunks = get_chunks(STUB, args.start, args.end, args.chunk_size)
 
@@ -227,9 +228,7 @@ if __name__ == "__main__":
         except Exception as e:
             logging.fatal("Fatal error in database consumer threads: %s", e)
 
-    if args.profile_timing:
-        for line in TIMING.report_lines():
-            logging.info(line)
+    log_timings()
 
     end_time = time.time()
     logging.info("Scraped blocks %d in %d seconds => %f blocks/s", args.end - args.start + 1, end_time - start_time, (args.end - args.start) / (end_time - start_time) if end_time - start_time > 0 else 0)
