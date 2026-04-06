@@ -1,3 +1,0 @@
-ETHEREUM_CHAIN_ID = 'eth'
-TRON_CHAIN_ID = 'tron'
-SOLANA_CHAIN_ID = 'solana'

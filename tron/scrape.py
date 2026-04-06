@@ -8,7 +8,7 @@ import threading
 
 import grpc
 
-from model.Tron import TF_QUEUE, TF_QUEUE, TX_QUEUE, TransactionDTO, TransferDTO, calc_trxID, sun_to_trx
+from model.Tron import TRON_QUEUE, TransactionDTO, TransferDTO, calc_trxID, extract_len_delimited_field, sun_to_trx
 
 sys.path.insert(0, os.path.abspath('./tron/generated'))
 sys.path.insert(0, os.path.abspath('./'))
@@ -100,7 +100,7 @@ def __call_value_to_transfer_dto(id, j, trx, internal, call_value, logger):
         not bool(internal.rejected)
     )
 
-def __trigger_smart_contract(block, trx, i, info, smart, logger: logging.Logger):
+def __trigger_smart_contract(block, trx, i, info, smart, logger: logging.Logger) -> tuple[TransactionDTO, list[TransferDTO]]:
     id = block.block_header.raw_data.number * SCALER + i % SCALER
     tx : TransactionDTO =  (
         id,
@@ -112,8 +112,8 @@ def __trigger_smart_contract(block, trx, i, info, smart, logger: logging.Logger)
         info.receipt.energy_usage if info.receipt.energy_usage is not None else 0,
         info.receipt.net_fee if info.receipt.net_fee is not None else 0
     )
-    TX_QUEUE.put(tx)
 
+    tfs = []
     j = 0
     if smart.call_value != 0:
         value_lo, value_hi = int_to_lo_hi(smart.call_value)
@@ -131,8 +131,8 @@ def __trigger_smart_contract(block, trx, i, info, smart, logger: logging.Logger)
             "Contract",
             bool(trx.ret[0].contractRet == protocol.Transaction.Result.SUCCESS)
         )
-        TF_QUEUE.put(tf)
         j += 1
+        tfs.append(tf)
 
     if smart.call_token_value != 0:
         value_lo, value_hi = int_to_lo_hi(smart.call_token_value)
@@ -150,25 +150,27 @@ def __trigger_smart_contract(block, trx, i, info, smart, logger: logging.Logger)
             "Contract",
             bool(trx.ret[0].contractRet == protocol.Transaction.Result.SUCCESS)
         )
-        TF_QUEUE.put(tf)
         j += 1
+        tfs.append(tf)
 
     j = 2
     for internal in info.internal_transactions:
         for call_value in internal.callValueInfo:
             tf: TransferDTO = __call_value_to_transfer_dto(id, j, trx, internal, call_value, logger)
-            TF_QUEUE.put(tf)
+            tfs.append(tf)
             j += 1
 
     for log in info.log:
         tf: TransferDTO = __log_to_transfer_dto(id, j, trx, info, log, smart, logger)
         if tf is not None:
-            TF_QUEUE.put(tf)
+            tfs.append(tf)
         else:
             pass
         j += 1
 
-def __transfer_contract(block, trx, i, info, transfer, logger: logging.Logger):
+    return tx, tfs
+
+def __transfer_contract(block, trx, i, info, transfer, logger: logging.Logger) -> tuple[TransactionDTO, list[TransferDTO]]:
     id = block.block_header.raw_data.number * SCALER + i % SCALER
 
     tx : TransactionDTO =  (
@@ -180,7 +182,6 @@ def __transfer_contract(block, trx, i, info, transfer, logger: logging.Logger):
         info.fee if info.fee is not None else 0,
         info.receipt.energy_usage if info.receipt.energy_usage is not None else 0,
         info.receipt.net_fee if info.receipt.net_fee is not None else 0)
-    TX_QUEUE.put(tx)
 
     value_lo, value_hi = int_to_lo_hi(transfer.amount)
     tf : TransferDTO = (
@@ -197,9 +198,9 @@ def __transfer_contract(block, trx, i, info, transfer, logger: logging.Logger):
         "Unknown",
         bool(trx.ret[0].contractRet == protocol.Transaction.Result.SUCCESS)
     )
-    TF_QUEUE.put(tf)
+    return tx, [tf]
 
-def __transfer_asset_contract(block, trx, i, info, transfer_asset, logger: logging.Logger):
+def __transfer_asset_contract(block, trx, i, info, transfer_asset, logger: logging.Logger) -> tuple[TransactionDTO, list[TransferDTO]]:
     id = block.block_header.raw_data.number * SCALER + i % SCALER
     tx : TransactionDTO =  (
         id,
@@ -211,7 +212,6 @@ def __transfer_asset_contract(block, trx, i, info, transfer_asset, logger: loggi
         info.receipt.energy_usage if info.receipt.energy_usage is not None else 0,
         info.receipt.net_fee if info.receipt.net_fee is not None else 0
     )
-    TX_QUEUE.put(tx)
 
     value_lo, value_hi = int_to_lo_hi(transfer_asset.amount)
     tf: TransferDTO = (
@@ -228,31 +228,33 @@ def __transfer_asset_contract(block, trx, i, info, transfer_asset, logger: loggi
         "Unknown",
         bool(trx.ret[0].contractRet == protocol.Transaction.Result.SUCCESS)
     )
-    TF_QUEUE.put(tf)
+    return tx, [tf]
 
 
-def __custom_contract(block, trx, i, info, custom, logger: logging.Logger):
+def __custom_contract(block, trx, i, info, custom, logger: logging.Logger) -> tuple[TransactionDTO, list[TransferDTO]]:
     pass
 
-def __parse_transaction(block, trx, i, info, logger: logging.Logger):
+def __parse_transaction(block, trx, i, info, logger: logging.Logger) -> tuple[TransactionDTO, list[TransferDTO]] | tuple[None, None]:
+    tx, tfs = None, None
     match trx.raw_data.contract[0].type:
         case protocol.Transaction.Contract.ContractType.TriggerSmartContract:
             msg = smart_contract_pb2.TriggerSmartContract()
             trx.raw_data.contract[0].parameter.Unpack(msg)
-            __trigger_smart_contract(block, trx, i, info, msg, logger)
+            tx, tfs = __trigger_smart_contract(block, trx, i, info, msg, logger)
         case protocol.Transaction.Contract.ContractType.TransferContract:
             msg = balance_contract_pb2.TransferContract()
             trx.raw_data.contract[0].parameter.Unpack(msg)
-            __transfer_contract(block, trx, i, info, msg, logger)
+            tx, tfs = __transfer_contract(block, trx, i, info, msg, logger)
         case protocol.Transaction.Contract.ContractType.TransferAssetContract:
             msg = asset_issue_contract_pb2.TransferAssetContract()
             trx.raw_data.contract[0].parameter.Unpack(msg)
-            __transfer_asset_contract(block, trx, i, info, msg, logger)
+            tx, tfs = __transfer_asset_contract(block, trx, i, info, msg, logger)
         case protocol.Transaction.Contract.ContractType.CustomContract:
-            owner_address = __extract_len_delimited_field(trx.raw_data.contract[0].parameter.value,1,)
-            __custom_contract(block, trx, i, info, owner_address, logger)
+            owner_address = extract_len_delimited_field(trx.raw_data.contract[0].parameter.value,1,)
+            tx, tfs = __custom_contract(block, trx, i, info, owner_address, logger)
         case _:
-            return
+            pass
+    return tx, tfs
 
 def __scrape_block(stub: tron_api.WalletStub, block_num: int, logger: logging.Logger):
     block = None
@@ -274,7 +276,9 @@ def __scrape_block(stub: tron_api.WalletStub, block_num: int, logger: logging.Lo
 
         with timed("scraper.processing"):
             for i, (trx, info) in enumerate(paired):
-                __parse_transaction(block, trx, i, info, logger)
+                tx, tfs = __parse_transaction(block, trx, i, info, logger)
+                if tx is not None and tfs is not None:
+                    TRON_QUEUE.put((tx, tfs))
 
     except Exception as e:
         logger.error("error processing block %d", block_num, exc_info=e)

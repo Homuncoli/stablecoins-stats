@@ -10,8 +10,7 @@ type TransactionDTO = tuple[int, bool, datetime, TransactionType, int, int, int,
 # transaction, index, transfer_type, token_asset_id, token_contract_addr, token_type, value, from_addr, from_type, to_addr, to_type, success 
 type TransferDTO = tuple[int, int, int, bytes, TokenType, int, bytes, str, bytes, str, bool] 
 
-TX_QUEUE = queue.Queue[TransactionDTO]()
-TF_QUEUE = queue.Queue[TransferDTO]()
+TRON_QUEUE = queue.Queue[tuple[TransactionDTO, list[TransferDTO]]]()
 
 def calc_trxID(trx) -> str:
         raw_bytes = trx.raw_data.SerializeToString()
