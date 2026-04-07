@@ -221,6 +221,7 @@ if __name__ == "__main__":
         finally:
             rpc_executor.shutdown(wait=False, cancel_futures=True)
 
+        logging.info("RPC scraping completed, waiting for database consumers to finish processing remaining items in queue...")
         db_stop_event.set()
         try:
             for thread in db_threads:

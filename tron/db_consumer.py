@@ -7,6 +7,8 @@ from psycopg_pool import ConnectionPool
 from metrics import timed
 from model.Tron import TRON_QUEUE, TransactionDTO, TransferDTO
 
+MERGE_LOCK = threading.Lock()
+
 def __create_staging_table(cur, staging_table: str):
     cur.execute(f"""
                     CREATE TEMP TABLE tx_{staging_table} (
@@ -38,66 +40,67 @@ def __create_staging_table(cur, staging_table: str):
                 """)
     
 def __merge_staging_table(cur, staging_table: str):
-    with timed("merging", "db"):
-        cur.execute(f"""
-                        INSERT INTO transactions (id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee)
-                        SELECT id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee
-                        FROM (
-                            SELECT DISTINCT ON (id)
-                                id,
-                                result,
-                                ts,
-                                transaction_t,
-                                fee_limit,
-                                fee,
-                                energy_usage,
-                                net_fee
-                            FROM tx_{staging_table}
-                            ORDER BY id, ts DESC NULLS LAST
-                        ) deduped
-                        ON CONFLICT (id) DO UPDATE SET
-                            result = EXCLUDED.result,
-                            ts = EXCLUDED.ts,
-                            transaction_t = EXCLUDED.transaction_t,
-                            fee_limit = EXCLUDED.fee_limit,
-                            fee = EXCLUDED.fee,
-                            energy_usage = EXCLUDED.energy_usage,
-                            net_fee = EXCLUDED.net_fee
-                    """)
-        cur.execute(f"""
-                        INSERT INTO addresses (addr, addr_t)
-                        SELECT DISTINCT s.from_addr, s.from_type FROM tf_{staging_table} s
-                                            WHERE s.from_addr IS NOT NULL
-                        ON CONFLICT (addr) DO NOTHING
-                    """)
-        cur.execute(f"""
-                        INSERT INTO addresses (addr, addr_t)
-                        SELECT DISTINCT s.to_addr, s.to_type FROM tf_{staging_table} s
-                                            WHERE s.to_addr IS NOT NULL
-                        ON CONFLICT (addr) DO NOTHING
-                    """)
-        cur.execute(f"""
-                        INSERT INTO addresses (addr, addr_t)
-                        SELECT DISTINCT s.token_contract_addr, 'Contract'::addr_type FROM tf_{staging_table} s
-                                            WHERE s.token_contract_addr IS NOT NULL
-                        ON CONFLICT (addr) DO UPDATE SET addr_t = 'Contract'::addr_type
-                    """)
-        cur.execute(f"""
-                        INSERT INTO tokens (contract_addr, asset_id, token_t)
-                        SELECT DISTINCT a.id, s.token_asset_id, s.token_t FROM tf_{staging_table} s
-                            LEFT JOIN addresses a ON s.token_contract_addr = a.addr
-                        ON CONFLICT DO NOTHING
-                    """)
-        cur.execute(f"""
-                        INSERT INTO transfers (transaction, index, token, value_lo, value_hi, from_addr, to_addr, success)
-                        SELECT s.transaction, s.index, COALESCE(t.id, 0), s.value_lo, s.value_hi, from_a.id, to_a.id, s.success
-                        FROM tf_{staging_table} s
-                        LEFT JOIN addresses from_a ON s.from_addr = from_a.addr
-                        LEFT JOIN addresses to_a ON s.to_addr = to_a.addr
-                        LEFT JOIN addresses token_a ON s.token_contract_addr = token_a.addr
-                        LEFT JOIN tokens t ON (s.token_contract_addr IS NOT NULL AND token_a.id = t.contract_addr) OR (s.token_asset_id IS NOT NULL AND s.token_asset_id = t.asset_id)
-                        ON CONFLICT (transaction, index) DO NOTHING
-                    """)
+    with MERGE_LOCK:
+        with timed("merging", "db"):
+            cur.execute(f"""
+                            INSERT INTO transactions (id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee)
+                            SELECT id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee
+                            FROM (
+                                SELECT DISTINCT ON (id)
+                                    id,
+                                    result,
+                                    ts,
+                                    transaction_t,
+                                    fee_limit,
+                                    fee,
+                                    energy_usage,
+                                    net_fee
+                                FROM tx_{staging_table}
+                                ORDER BY id, ts DESC NULLS LAST
+                            ) deduped
+                            ON CONFLICT (id) DO UPDATE SET
+                                result = EXCLUDED.result, 
+                                ts = EXCLUDED.ts,
+                                transaction_t = EXCLUDED.transaction_t,
+                                fee_limit = EXCLUDED.fee_limit,
+                                fee = EXCLUDED.fee,
+                                energy_usage = EXCLUDED.energy_usage,
+                                net_fee = EXCLUDED.net_fee
+                        """)
+            cur.execute(f"""
+                            INSERT INTO addresses (addr, addr_t)
+                            SELECT DISTINCT s.from_addr, s.from_type FROM tf_{staging_table} s
+                                                WHERE s.from_addr IS NOT NULL
+                            ON CONFLICT (addr) DO NOTHING
+                        """)
+            cur.execute(f"""
+                            INSERT INTO addresses (addr, addr_t)
+                            SELECT DISTINCT s.to_addr, s.to_type FROM tf_{staging_table} s
+                                                WHERE s.to_addr IS NOT NULL
+                            ON CONFLICT (addr) DO NOTHING
+                        """)
+            cur.execute(f"""
+                            INSERT INTO addresses (addr, addr_t)
+                            SELECT DISTINCT s.token_contract_addr, 'Contract'::addr_type FROM tf_{staging_table} s
+                                                WHERE s.token_contract_addr IS NOT NULL
+                            ON CONFLICT (addr) DO UPDATE SET addr_t = 'Contract'::addr_type
+                        """)
+            cur.execute(f"""
+                            INSERT INTO tokens (contract_addr, asset_id, token_t)
+                            SELECT DISTINCT a.id, s.token_asset_id, s.token_t FROM tf_{staging_table} s
+                                LEFT JOIN addresses a ON s.token_contract_addr = a.addr
+                            ON CONFLICT DO NOTHING
+                        """)
+            cur.execute(f"""
+                            INSERT INTO transfers (transaction, index, token, value_lo, value_hi, from_addr, to_addr, success)
+                            SELECT s.transaction, s.index, COALESCE(t.id, 0), s.value_lo, s.value_hi, from_a.id, to_a.id, s.success
+                            FROM tf_{staging_table} s
+                            LEFT JOIN addresses from_a ON s.from_addr = from_a.addr
+                            LEFT JOIN addresses to_a ON s.to_addr = to_a.addr
+                            LEFT JOIN addresses token_a ON s.token_contract_addr = token_a.addr
+                            LEFT JOIN tokens t ON (s.token_contract_addr IS NOT NULL AND token_a.id = t.contract_addr) OR (s.token_asset_id IS NOT NULL AND s.token_asset_id = t.asset_id)
+                            ON CONFLICT (transaction, index) DO NOTHING
+                        """)
     
 def __copy_tx_to_staging_table(cur, buffer: list[TransactionDTO], staging_table: str):
     with timed("copy_tx", "db"):
