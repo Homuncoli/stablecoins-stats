@@ -8,7 +8,7 @@ import threading
 
 import grpc
 
-from model.Tron import TRON_QUEUE, TransactionDTO, TransferDTO, calc_trxID, extract_len_delimited_field, sun_to_trx
+from model.Tron import TRON_QUEUE, TransactionDTO, TransferDTO, calc_trxID, extract_len_delimited_field, int_to_lo_hi, sun_to_trx
 
 sys.path.insert(0, os.path.abspath('./tron/generated'))
 sys.path.insert(0, os.path.abspath('./'))
@@ -22,30 +22,6 @@ from tron.generated.core.contract import smart_contract_pb2
 from metrics import timed
 
 SCALER = 1_000
-
-def int_to_lo_hi(value: int) -> tuple[int, int]:
-    if value < 0 or value > (2**256 - 1):
-        raise ValueError(f"Value must be in range [0, 2^256 - 1], got {value}")
-
-    lo = value & 0xFFFFFFFFFFFFFFFF  # lower 64 bits
-    hi = (value >> 64) & 0xFFFFFFFFFFFFFFFF  # upper 64 bits (of lower 128)
-
-    # Convert to signed int64 for Postgres BIGINT
-    if lo > 9223372036854775807:
-        lo -= 18446744073709551616
-    if hi > 9223372036854775807:
-        hi -= 18446744073709551616
-
-    return lo, hi
-
-def lo_hi_to_int(lo: int, hi: int) -> int:
-    # Convert from signed int64 to unsigned
-    if lo < 0:
-        lo += 18446744073709551616
-    if hi < 0:
-        hi += 18446744073709551616
-
-    return (hi << 64) | lo
 
 def __pair_transactions_with_infos(block, infos):
     info_by_txid = { info.id.hex(): info for info in infos.transactionInfo }
@@ -268,6 +244,7 @@ def __scrape_block(stub: tron_api.WalletStub, block_num: int, logger: logging.Lo
         logger.fatal("RPC error while scraping block %d", block_num, exc_info=e)
         raise e
     
+    block_data: list[tuple[TransactionDTO, list[TransferDTO]]] = []
     try:
         paired = None
 
@@ -278,7 +255,9 @@ def __scrape_block(stub: tron_api.WalletStub, block_num: int, logger: logging.Lo
             for i, (trx, info) in enumerate(paired):
                 tx, tfs = __parse_transaction(block, trx, i, info, logger)
                 if tx is not None and tfs is not None:
-                    TRON_QUEUE.put((tx, tfs))
+                    block_data.append((tx, tfs))
+
+        TRON_QUEUE.put(block_data)
 
     except Exception as e:
         logger.error("error processing block %d", block_num, exc_info=e)

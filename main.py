@@ -229,6 +229,8 @@ if __name__ == "__main__":
         except Exception as e:
             logging.fatal("Fatal error in database consumer threads: %s", e)
 
+    CHANNEL.close()
+
     log_timings()
 
     end_time = time.time()

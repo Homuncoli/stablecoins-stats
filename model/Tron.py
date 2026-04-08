@@ -10,7 +10,7 @@ type TransactionDTO = tuple[int, bool, datetime, TransactionType, int, int, int,
 # transaction, index, transfer_type, token_asset_id, token_contract_addr, token_type, value, from_addr, from_type, to_addr, to_type, success 
 type TransferDTO = tuple[int, int, int, bytes, TokenType, int, bytes, str, bytes, str, bool] 
 
-TRON_QUEUE = queue.Queue[tuple[TransactionDTO, list[TransferDTO]]](4_000_000)
+TRON_QUEUE = queue.Queue[list[tuple[TransactionDTO, list[TransferDTO]]]](250_000)
 
 def calc_trxID(trx) -> str:
         raw_bytes = trx.raw_data.SerializeToString()
@@ -77,3 +77,27 @@ def sun_to_trx(sun: int) -> float:
 
 def trx_to_sun(trx: float) -> int:
     return int(trx * 1_000_000)
+
+def int_to_lo_hi(value: int) -> tuple[int, int]:
+    if value < 0 or value > (2**256 - 1):
+        raise ValueError(f"Value must be in range [0, 2^256 - 1], got {value}")
+
+    lo = value & 0xFFFFFFFFFFFFFFFF  # lower 64 bits
+    hi = (value >> 64) & 0xFFFFFFFFFFFFFFFF  # upper 64 bits (of lower 128)
+
+    # Convert to signed int64 for Postgres BIGINT
+    if lo > 9223372036854775807:
+        lo -= 18446744073709551616
+    if hi > 9223372036854775807:
+        hi -= 18446744073709551616
+
+    return lo, hi
+
+def lo_hi_to_int(lo: int, hi: int) -> int:
+    # Convert from signed int64 to unsigned
+    if lo < 0:
+        lo += 18446744073709551616
+    if hi < 0:
+        hi += 18446744073709551616
+
+    return (hi << 64) | lo

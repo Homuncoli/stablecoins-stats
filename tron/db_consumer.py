@@ -129,20 +129,14 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
 
                 uncommited_tx = 0
                 while not stop_event.is_set() or not TRON_QUEUE.empty():
-                    tx, tfs = None, None
                     try:
-                        tx, tfs = TRON_QUEUE.get(timeout=timeout)
+                        block_data = TRON_QUEUE.get(timeout=timeout)
                     except Empty:
-                        pass
-
-                    if tx is None and tfs is None:
                         logger.warning("timed out")
                         continue
 
-                    if tx is not None:
+                    for tx, tfs in block_data:
                         tx_buffer.append(tx)
-
-                    if tfs is not None:
                         tf_buffer.extend(tfs)
 
                     if len(tx_buffer) >= commit_size:
