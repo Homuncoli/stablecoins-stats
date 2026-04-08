@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import threading
+from eth_abi import decode
 
 import grpc
 
@@ -22,16 +23,22 @@ from tron.generated.core.contract import smart_contract_pb2
 from metrics import timed
 
 SCALER = 1_000
+SCRAPE_PROGRESS = []
 
 def __pair_transactions_with_infos(block, infos):
     info_by_txid = { info.id.hex(): info for info in infos.transactionInfo }
     return [ (trx, info_by_txid.get(calc_trxID(trx))) for trx in block.transactions ]
 
 def __transfer_log_to_transfer_dto(id, j, trx, info, log, smart, logger):
-    from_address = b'0x41' + log.topics[1].hex()[-40:].encode()
-    to_address = b'0x41' + log.topics[2].hex()[-40:].encode()
-    value = int(log.data.hex(), 16) if log.data != b'' else 0
-    value_lo, value_hi = int_to_lo_hi(value)
+    if len(log.topics) < 3: # old encoding
+        from_address, to_address, value = decode(['address', 'address', 'uint256'], log.data)
+        value_lo, value_hi = int_to_lo_hi(value)
+        print(calc_trxID(trx), from_address, to_address, value)
+    else:
+        from_address = b'0x41' + log.topics[1].hex()[-40:].encode()
+        to_address = b'0x41' + log.topics[2].hex()[-40:].encode()
+        value = int(log.data.hex(), 16) if log.data != b'' else 0
+        value_lo, value_hi = int_to_lo_hi(value)
     return (
         id,
         j,
@@ -52,6 +59,9 @@ LOG_TO_TRANSFER = {
 }
 
 def __log_to_transfer_dto(id, j, trx, info, log, smart, logger):
+    if len(log.topics) == 0:
+        return None
+    
     keccak256 = log.topics[0].hex()
     if keccak256 in LOG_TO_TRANSFER:
         return LOG_TO_TRANSFER[keccak256](id, j, trx, info, log, smart, logger)
@@ -140,9 +150,9 @@ def __trigger_smart_contract(block, trx, i, info, smart, logger: logging.Logger)
         tf: TransferDTO = __log_to_transfer_dto(id, j, trx, info, log, smart, logger)
         if tf is not None:
             tfs.append(tf)
+            j += 1
         else:
             pass
-        j += 1
 
     return tx, tfs
 
@@ -232,7 +242,7 @@ def __parse_transaction(block, trx, i, info, logger: logging.Logger) -> tuple[Tr
             pass
     return tx, tfs
 
-def __scrape_block(stub: tron_api.WalletStub, block_num: int, logger: logging.Logger):
+def __scrape_block(stub: tron_api.WalletStub, block_num: int, logger: logging.Logger, chunk_id: int):
     block = None
     infos = None
     
@@ -258,6 +268,7 @@ def __scrape_block(stub: tron_api.WalletStub, block_num: int, logger: logging.Lo
                     block_data.append((tx, tfs))
 
         TRON_QUEUE.put(block_data)
+        SCRAPE_PROGRESS[chunk_id] += 1
 
     except Exception as e:
         logger.error("error processing block %d", block_num, exc_info=e)
@@ -272,7 +283,7 @@ def scrape(stub: tron_api.WalletStub, chunk_id: int, chunk_start: int, chunk_end
         for block in range(chunk_start, chunk_end + 1):
             current = block
 
-            __scrape_block(stub, block, logger)
+            __scrape_block(stub, block, logger, chunk_id)
 
             if stop_event.is_set():
                 logger.info("stopped")

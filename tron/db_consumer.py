@@ -128,12 +128,17 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
                 __create_staging_table(cur, staging_table)
 
                 uncommited_tx = 0
-                while not stop_event.is_set() or not TRON_QUEUE.empty():
+                while True:
                     try:
                         block_data = TRON_QUEUE.get(timeout=timeout)
                     except Empty:
-                        logger.warning("timed out")
+                        if not stop_event.is_set():
+                            logger.warning("timed out")
                         continue
+
+                    if block_data is None:
+                        logger.debug("received shutdown sentinel")
+                        break
 
                     for tx, tfs in block_data:
                         tx_buffer.append(tx)
