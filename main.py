@@ -80,6 +80,7 @@ def monitor_metrics(db_stop, stop_event: threading.Event, args, rpc_futures: lis
             unit="blocks",
             desc="Scraped",
             bar_format=PROGRESS_BAR_FORMAT,
+            smoothing=0.7
         ) as pbar:
             last_done = 0
             while not stop_event.is_set() and not db_stop.is_set():
@@ -122,6 +123,7 @@ def monitor_metrics(db_stop, stop_event: threading.Event, args, rpc_futures: lis
             unit="transactions",
             desc="Backlog",
             bar_format=PROGRESS_BAR_FORMAT,
+            smoothing=0.7
         ) as pbar:
             last_queue_size = TRON_QUEUE.qsize()
             while not stop_event.is_set() or TRON_QUEUE.unfinished_tasks > 0:
