@@ -1,9 +1,11 @@
 import logging
 import random
+import time
 from queue import Empty
 import threading
 from datetime import datetime, timezone
 
+import psycopg
 from psycopg_pool import ConnectionPool
 
 from metrics import timed
@@ -121,6 +123,28 @@ def __merge_staging_table(cur, staging_table: str):
                             ON CONFLICT (transaction, index) DO NOTHING
                         """)
 
+
+def __merge_staging_table_with_retry(cur, staging_table: str, logger: logging.Logger, retries: int = 3):
+    for attempt in range(1, retries + 1):
+        cur.execute("SAVEPOINT merge_staging")
+        try:
+            __merge_staging_table(cur, staging_table)
+            cur.execute("RELEASE SAVEPOINT merge_staging")
+            return
+        except psycopg.errors.DeadlockDetected:
+            cur.execute("ROLLBACK TO SAVEPOINT merge_staging")
+            if attempt >= retries:
+                raise
+
+            delay = 0.25 * attempt
+            logger.warning(
+                "deadlock while merging staging table, retrying attempt %d/%d in %.2fs",
+                attempt,
+                retries,
+                delay,
+            )
+            time.sleep(delay)
+
 def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Event, timeout: float | None, commit_size: int, merge_size: int, metrics: int):
     logger = logging.getLogger(f"db-consumer-{consumer_id}")
     logger.debug("started")
@@ -219,7 +243,7 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
 
                     if uncommited_tx >= merge_target:
                         logger.debug("merging staging table after processing %d transactions", uncommited_tx)
-                        __merge_staging_table(cur, staging_table)
+                        __merge_staging_table_with_retry(cur, staging_table, logger)
                         with timed("commit", "db"):
                             conn.commit()
                         uncommited_tx = 0
@@ -233,7 +257,7 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
                     uncommited_tx += tx_buffer_rows
                     tx_buffer_rows = 0
                 logger.debug("merging staging table for the last time with %d uncommited transactions", uncommited_tx)
-                __merge_staging_table(cur, staging_table)
+                __merge_staging_table_with_retry(cur, staging_table, logger)
                 with timed("commit", "db"):
                     conn.commit()
                 logger.debug("stopped")
