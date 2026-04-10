@@ -129,20 +129,21 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
 
                 uncommited_tx = 0
                 while True:
-                    try:
-                        block_data = TRON_QUEUE.get(timeout=timeout)
-                    except Empty:
-                        if not stop_event.is_set():
-                            logger.warning("timed out")
-                        continue
-
-                    if block_data is None:
-                        logger.debug("received shutdown sentinel")
-                        break
-
-                    for tx, tfs in block_data:
-                        tx_buffer.append(tx)
-                        tf_buffer.extend(tfs)
+                    with timed("queue", "db"):
+                        try:
+                            block_data = TRON_QUEUE.get(timeout=timeout)
+                        except Empty:
+                            if not stop_event.is_set():
+                                logger.warning("timed out")
+                            continue
+                        
+                        if block_data is None:
+                            logger.debug("received shutdown sentinel")
+                            break
+                        
+                        for tx, tfs in block_data:
+                            tx_buffer.append(tx)
+                            tf_buffer.extend(tfs)
 
                     if len(tx_buffer) >= commit_size:
                         __copy_tx_to_staging_table(cur, tx_buffer, staging_table)
