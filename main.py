@@ -124,7 +124,7 @@ def monitor_metrics(db_stop, stop_event: threading.Event, args, rpc_futures: lis
             bar_format=PROGRESS_BAR_FORMAT,
         ) as pbar:
             last_queue_size = TRON_QUEUE.qsize()
-            while not stop_event.is_set() or not TRON_QUEUE.empty():
+            while not stop_event.is_set() or TRON_QUEUE.unfinished_tasks > 0:
                 queue_size = TRON_QUEUE.qsize()
                 queue_history.append(queue_size)
                 if len(queue_history) > QUEUE_HISTORY_LIMIT:
@@ -287,6 +287,8 @@ if __name__ == "__main__":
             for _ in range(args.db_consumers):
                 TRON_QUEUE.put(None)
             try:
+                TRON_QUEUE.join()
+                logging.info("All items in queue processed, waiting for database consumer threads to exit...")
                 for thread in db_threads:
                     thread.join()
             except Exception as e:
