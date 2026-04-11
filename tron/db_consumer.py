@@ -15,6 +15,7 @@ MERGE_LOCK = threading.Lock()
 DB_SYNC_LOCK = threading.Lock()
 DB_NEXT_SYNC = 0
 TOTAL_CONSUMERS = 0
+TX_LIMIT = 1_000_000
 
 def __copy_binary_to_staging_table(cur, buffer: list[tuple], staging_table: str, columns: str, type_names: list[str]):
     if not buffer:
@@ -258,7 +259,7 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
                             TRON_QUEUE.task_done()
 
                     # Only one consumer may sync with DB at a time; others continue draining the queue.
-                    sync_staging(force=False)
+                    sync_staging(force=len(tx_buffer) > TX_LIMIT)
 
                 if tx_buffer_rows > 0 or uncommited_tx > 0:
                     logger.info("stopping, flushing remaining buffers to DB")
