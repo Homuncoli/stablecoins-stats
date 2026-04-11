@@ -23,7 +23,7 @@ import grpc
 from metrics import TIMING, log_timings
 from model.Tron import TRON_QUEUE
 from tron import scrape as tron
-from tron.db_consumer import db_consumer
+import tron.db_consumer as db_consumer_module
 
 sys.path.insert(0, os.path.abspath('./tron/generated'))
 sys.path.insert(0, os.path.abspath('./'))
@@ -80,7 +80,7 @@ def monitor_metrics(db_stop, stop_event: threading.Event, args, rpc_futures: lis
             unit="blocks",
             desc="Scraped",
             bar_format=PROGRESS_BAR_FORMAT,
-            smoothing=0.7
+            smoothing=1.0
         ) as pbar:
             last_done = 0
             while not stop_event.is_set() and not db_stop.is_set():
@@ -123,7 +123,7 @@ def monitor_metrics(db_stop, stop_event: threading.Event, args, rpc_futures: lis
             unit="transactions",
             desc="Backlog",
             bar_format=PROGRESS_BAR_FORMAT,
-            smoothing=0.7
+            smoothing=1.0
         ) as pbar:
             last_queue_size = TRON_QUEUE.qsize()
             while not stop_event.is_set() or TRON_QUEUE.unfinished_tasks > 0:
@@ -164,6 +164,8 @@ if __name__ == "__main__":
     ap.add_argument("--profile-timing", action="store_true", help="Enable detailed timing of scraping and database operations")
     ap.add_argument("--metrics", type=int, default=5, help="Interval in seconds to log scraping metrics (blocks/sec, queue sizes, etc.)")
     args = ap.parse_args()
+
+    db_consumer_module.TOTAL_CONSUMERS = args.db_consumers
 
     logging.basicConfig(level=getattr(logging, args.debug.upper()), format='%(asctime)s - %(name)s - %(levelname)s: %(message)s')
 
@@ -208,7 +210,7 @@ if __name__ == "__main__":
         with ConnectionPool(args.pg, max_size=max(args.db_consumers, 4), name="db_pool") as db_pool:
             for i in range(args.db_consumers):
                 thread = threading.Thread(
-                    target=db_consumer,
+                    target=db_consumer_module.db_consumer,
                     kwargs={
                         "pool": db_pool,
                         "timeout": TIMEOUT,

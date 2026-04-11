@@ -12,7 +12,9 @@ from metrics import timed
 from model.Tron import TRON_QUEUE, TransactionDTO, TransferDTO
 
 MERGE_LOCK = threading.Lock()
-
+DB_SYNC_LOCK = threading.Lock()
+DB_NEXT_SYNC = 0
+TOTAL_CONSUMERS = 0
 
 def __copy_binary_to_staging_table(cur, buffer: list[tuple], staging_table: str, columns: str, type_names: list[str]):
     if not buffer:
@@ -66,27 +68,8 @@ def __merge_staging_table(cur, staging_table: str):
             cur.execute(f"""
                             INSERT INTO transactions (id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee)
                             SELECT id, result, ts, transaction_t::transaction_type, fee_limit, fee, energy_usage, net_fee
-                            FROM (
-                                SELECT DISTINCT ON (id)
-                                    id,
-                                    result,
-                                    ts,
-                                    transaction_t,
-                                    fee_limit,
-                                    fee,
-                                    energy_usage,
-                                    net_fee
-                                FROM tx_{staging_table}
-                                ORDER BY id, ts DESC NULLS LAST
-                            ) deduped
-                            ON CONFLICT (id) DO UPDATE SET
-                                result = EXCLUDED.result, 
-                                ts = EXCLUDED.ts,
-                                transaction_t = EXCLUDED.transaction_t,
-                                fee_limit = EXCLUDED.fee_limit,
-                                fee = EXCLUDED.fee,
-                                energy_usage = EXCLUDED.energy_usage,
-                                net_fee = EXCLUDED.net_fee
+                            FROM tx_{staging_table}
+                            ON CONFLICT (id) DO NOTHING
                         """)
             cur.execute(f"""
                             INSERT INTO addresses (addr, addr_t)
@@ -207,6 +190,49 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
                 merge_target = __next_merge_target(merge_size, rng)
                 commit_target = __next_merge_target(commit_size, rng)
                 logger.debug("initial randomized sizes to %d commits %d merges", commit_target, merge_target)
+
+                def sync_staging(force: bool) -> bool:
+                    global DB_NEXT_SYNC
+                    nonlocal uncommited_tx, tx_buffer_rows, commit_target, merge_target
+                    
+                    try:
+                        if tx_buffer_rows > 0 and (force or tx_buffer_rows >= commit_target):
+                            logger.debug("copying binary buffers to staging after processing %d transactions", tx_buffer_rows)
+                            __copy_binary_to_staging_table(cur, tx_buffer, f"tx_{staging_table}", "id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee", tx_copy_types)
+                            __copy_binary_to_staging_table(cur, tf_buffer, f"tf_{staging_table}", "transaction, index, token_asset_id, token_contract_addr, token_t, value_lo, value_hi, from_addr, from_type, to_addr, to_type, success", tf_copy_types)
+                            uncommited_tx += tx_buffer_rows
+                            tx_buffer.clear()
+                            tf_buffer.clear()
+                            tx_buffer_rows = 0
+                            commit_target = __next_merge_target(commit_size, rng)
+                    finally:
+                        pass
+
+                    if not (uncommited_tx > 0 and (force or uncommited_tx >= merge_target)):
+                        return False
+
+                    acquired = DB_SYNC_LOCK.acquire(blocking=force)
+                    if not acquired:
+                        return False
+
+                    try:
+                        if DB_NEXT_SYNC != consumer_id and not force:
+                            return False
+
+                        if uncommited_tx > 0 and (force or uncommited_tx >= merge_target):
+                            logger.debug("merging staging table after processing %d transactions", uncommited_tx)
+                            __merge_staging_table_with_retry(cur, staging_table, logger)
+                            with timed("commit", "db"):
+                                conn.commit()
+                            uncommited_tx = 0
+                            merge_target = __next_merge_target(merge_size, rng)
+                            logger.debug("next randomized merge size set to %d transactions", merge_target)
+
+                        DB_NEXT_SYNC = (DB_NEXT_SYNC + 1) % TOTAL_CONSUMERS
+                        return True
+                    finally:
+                        DB_SYNC_LOCK.release()
+
                 while True:
                     with timed("queue", "db"):
                         try:
@@ -231,35 +257,15 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
                         finally:
                             TRON_QUEUE.task_done()
 
-                    if tx_buffer_rows >= commit_target:
-                        logger.debug("copying binary buffers to staging after processing %d transactions", tx_buffer_rows)
-                        __copy_binary_to_staging_table(cur, tx_buffer, f"tx_{staging_table}", "id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee", tx_copy_types)
-                        __copy_binary_to_staging_table(cur, tf_buffer, f"tf_{staging_table}", "transaction, index, token_asset_id, token_contract_addr, token_t, value_lo, value_hi, from_addr, from_type, to_addr, to_type, success", tf_copy_types)
-                        uncommited_tx += tx_buffer_rows
-                        tx_buffer.clear()
-                        tf_buffer.clear()
-                        tx_buffer_rows = 0
-                        commit_target = __next_merge_target(commit_size, rng)
+                    # Only one consumer may sync with DB at a time; others continue draining the queue.
+                    sync_staging(force=False)
 
-                    if uncommited_tx >= merge_target:
-                        logger.debug("merging staging table after processing %d transactions", uncommited_tx)
-                        __merge_staging_table_with_retry(cur, staging_table, logger)
-                        with timed("commit", "db"):
-                            conn.commit()
-                        uncommited_tx = 0
-                        merge_target = __next_merge_target(merge_size, rng)
-                        logger.debug("next randomized merge size set to %d transactions", merge_target)
+                if tx_buffer_rows > 0 or uncommited_tx > 0:
+                    logger.info("stopping, flushing remaining buffers to DB")
 
-                if tx_buffer_rows > 0:
-                    logger.info("stopping, flushing remaining binary buffers")
-                    __copy_binary_to_staging_table(cur, tx_buffer, f"tx_{staging_table}", "id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee", tx_copy_types)
-                    __copy_binary_to_staging_table(cur, tf_buffer, f"tf_{staging_table}", "transaction, index, token_asset_id, token_contract_addr, token_t, value_lo, value_hi, from_addr, from_type, to_addr, to_type, success", tf_copy_types)
-                    uncommited_tx += tx_buffer_rows
-                    tx_buffer_rows = 0
-                logger.debug("merging staging table for the last time with %d uncommited transactions", uncommited_tx)
-                __merge_staging_table_with_retry(cur, staging_table, logger)
-                with timed("commit", "db"):
-                    conn.commit()
+                while tx_buffer_rows > 0 or uncommited_tx > 0:
+                    sync_staging(force=True)
+
                 logger.debug("stopped")
 
     except Exception as e:
