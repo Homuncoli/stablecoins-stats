@@ -17,6 +17,10 @@ DB_NEXT_SYNC = 0
 TOTAL_CONSUMERS = 0
 TX_LIMIT = 1_000_000
 
+BUFFER_PROGRESS = []
+COMMIT_PROGRESS = []
+MERGE_PROGRESS = []
+
 def __copy_binary_to_staging_table(cur, buffer: list[tuple], staging_table: str, columns: str, type_names: list[str]):
     if not buffer:
         return
@@ -106,6 +110,8 @@ def __merge_staging_table(cur, staging_table: str):
                             LEFT JOIN tokens t ON (s.token_contract_addr IS NOT NULL AND token_a.id = t.contract_addr) OR (s.token_asset_id IS NOT NULL AND s.token_asset_id = t.asset_id)
                             ON CONFLICT (transaction, index) DO NOTHING
                         """)
+            # Keep merge work bounded: each batch should be merged exactly once.
+            cur.execute(f"TRUNCATE TABLE tx_{staging_table}, tf_{staging_table}")
 
 
 def __merge_staging_table_with_retry(cur, staging_table: str, logger: logging.Logger, retries: int = 3):
@@ -202,6 +208,7 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
                             __copy_binary_to_staging_table(cur, tx_buffer, f"tx_{staging_table}", "id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee", tx_copy_types)
                             __copy_binary_to_staging_table(cur, tf_buffer, f"tf_{staging_table}", "transaction, index, token_asset_id, token_contract_addr, token_t, value_lo, value_hi, from_addr, from_type, to_addr, to_type, success", tf_copy_types)
                             uncommited_tx += tx_buffer_rows
+                            COMMIT_PROGRESS[consumer_id] += tx_buffer_rows
                             tx_buffer.clear()
                             tf_buffer.clear()
                             tx_buffer_rows = 0
@@ -209,30 +216,23 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
                     finally:
                         pass
 
-                    if not (uncommited_tx > 0 and (force or uncommited_tx >= merge_target)):
+                    if uncommited_tx == 0 or (not force and uncommited_tx < commit_target):
                         return False
 
-                    acquired = DB_SYNC_LOCK.acquire(blocking=force)
-                    if not acquired:
+                    if not DB_NEXT_SYNC == consumer_id and not force:
                         return False
-
-                    try:
-                        if DB_NEXT_SYNC != consumer_id and not force:
-                            return False
-
-                        if uncommited_tx > 0 and (force or uncommited_tx >= merge_target):
-                            logger.debug("merging staging table after processing %d transactions", uncommited_tx)
-                            __merge_staging_table_with_retry(cur, staging_table, logger)
-                            with timed("commit", "db"):
-                                conn.commit()
-                            uncommited_tx = 0
-                            merge_target = __next_merge_target(merge_size, rng)
-                            logger.debug("next randomized merge size set to %d transactions", merge_target)
-
-                        DB_NEXT_SYNC = (DB_NEXT_SYNC + 1) % TOTAL_CONSUMERS
-                        return True
-                    finally:
-                        DB_SYNC_LOCK.release()
+                    
+                    if uncommited_tx > 0 and (force or uncommited_tx >= merge_target):
+                        logger.debug("merging staging table after processing %d transactions", uncommited_tx)
+                        __merge_staging_table_with_retry(cur, staging_table, logger)
+                        with timed("commit", "db"):
+                            conn.commit()
+                        MERGE_PROGRESS[consumer_id] += uncommited_tx
+                        uncommited_tx = 0
+                        merge_target = __next_merge_target(merge_size, rng)
+                        logger.debug("next randomized merge size set to %d transactions", merge_target)
+                    DB_NEXT_SYNC = (DB_NEXT_SYNC + 1) % TOTAL_CONSUMERS
+                    return True
 
                 while True:
                     with timed("queue", "db"):
@@ -255,6 +255,7 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
                                 for tf in tfs:
                                     tf_buffer.append(to_tf_binary_row(tf))
                             tx_buffer_rows += len([tx for tx, _ in block_data])
+                            BUFFER_PROGRESS[consumer_id] += 1
                         finally:
                             TRON_QUEUE.task_done()
 

@@ -74,77 +74,68 @@ def monitor_metrics(db_stop, stop_event: threading.Event, args, rpc_futures: lis
     queue_size_total = 0
     queue_size_samples = 0
     queue_history: list[int] = []
+    SMOOTHING = 1.0
     with logging_redirect_tqdm():
         with tqdm(
             total=args.chunk_size * len(rpc_futures),
             unit="blocks",
             desc="Scraped",
             bar_format=PROGRESS_BAR_FORMAT,
-            smoothing=1.0
-        ) as pbar:
-            last_done = 0
-            while not stop_event.is_set() and not db_stop.is_set():
-                done = sum(tron.SCRAPE_PROGRESS)
-                current_queue_size = TRON_QUEUE.qsize()
+            smoothing=SMOOTHING,
+            leave=True
+        ) as scrape_pbar:
+            with tqdm(
+                total=args.chunk_size * len(rpc_futures),
+                unit="blocks",
+                desc="Buffered",
+                bar_format=PROGRESS_BAR_FORMAT,
+                smoothing=SMOOTHING,
+                leave=True) as buffered_pbar:
+                with tqdm(
+                    unit="transactions",
+                    desc="Committed",
+                    bar_format=PROGRESS_BAR_FORMAT,
+                    smoothing=SMOOTHING,
+                    leave=True) as committed_pbar:
+                        with tqdm(
+                            unit="transactions",
+                            desc="Merged",
+                            bar_format=PROGRESS_BAR_FORMAT,
+                            smoothing=SMOOTHING,
+                            leave=False) as merged_pbar:
+                            last_done = [0, 0, 0, 0]
+                            while not stop_event.is_set():
+                                scraped = sum(tron.SCRAPE_PROGRESS)
+                                buffered = sum(db_consumer_module.BUFFER_PROGRESS)
+                                committed = sum(db_consumer_module.COMMIT_PROGRESS)
+                                merged = sum(db_consumer_module.MERGE_PROGRESS)
 
-                queue_size_total += current_queue_size
-                queue_size_samples += 1
-                queue_history.append(current_queue_size)
-                if len(queue_history) > QUEUE_HISTORY_LIMIT:
-                    del queue_history[:-QUEUE_HISTORY_LIMIT]
-                if len(queue_history) >= 2:
-                    tqdm.write(render_queue_chart(queue_history))
+                                current_queue_size = TRON_QUEUE.qsize()
+                                queue_size_total += current_queue_size
+                                queue_size_samples += 1
+                                queue_history.append(current_queue_size)
+                                if len(queue_history) > QUEUE_HISTORY_LIMIT:
+                                    del queue_history[:-QUEUE_HISTORY_LIMIT]
+                                if len(queue_history) >= 2:
+                                    tqdm.write(render_queue_chart(queue_history))
 
-                pbar.update(done - last_done)
-                pbar.set_postfix({
-                    "queue": current_queue_size
-                })
+                                scrape_pbar.update(scraped - last_done[0])
+                                buffered_pbar.update(buffered - last_done[1])
+                                committed_pbar.update(committed - last_done[2])
+                                merged_pbar.update(merged - last_done[3])
+                                
+                                last_done = [scraped, buffered, committed, merged]
+                                time.sleep(interval)
 
-                last_done = done
-                if done == args.chunk_size * len(rpc_futures):
-                    break
-                time.sleep(interval)
-
-            done = sum(tron.SCRAPE_PROGRESS)
-            current_queue_size = TRON_QUEUE.qsize()
-                
-            pbar.update(done - last_done)
-            pbar.set_postfix({
-                "queue": current_queue_size
-            })
-
-        logger.info(
-            "Average queue size during scraping: %f",
-            queue_size_total / queue_size_samples if queue_size_samples > 0 else 0,
-        )
-        
-        with tqdm(
-            total=TRON_QUEUE.qsize(),
-            unit="transactions",
-            desc="Backlog",
-            bar_format=PROGRESS_BAR_FORMAT,
-            smoothing=1.0
-        ) as pbar:
-            last_queue_size = TRON_QUEUE.qsize()
-            while not stop_event.is_set() or TRON_QUEUE.unfinished_tasks > 0:
-                queue_size = TRON_QUEUE.qsize()
-                queue_history.append(queue_size)
-                if len(queue_history) > QUEUE_HISTORY_LIMIT:
-                    del queue_history[:-QUEUE_HISTORY_LIMIT]
-                if len(queue_history) >= 2:
-                    tqdm.write(render_queue_chart(queue_history))
-
-                pbar.update(last_queue_size - queue_size)
-                pbar.set_postfix({
-                    "pending": queue_size
-                })
-
-                last_queue_size = queue_size
-                time.sleep(interval)
-            pbar.update(last_queue_size - TRON_QUEUE.qsize())
-            pbar.set_postfix({
-                "pending": TRON_QUEUE.qsize()
-            })
+                            scraped = sum(tron.SCRAPE_PROGRESS)
+                            buffered = sum(db_consumer_module.BUFFER_PROGRESS)
+                            committed = sum(db_consumer_module.COMMIT_PROGRESS)
+                            merged = sum(db_consumer_module.MERGE_PROGRESS)
+                                
+                            scrape_pbar.update(scraped - last_done[0])
+                            buffered_pbar.update(buffered - last_done[1])
+                            committed_pbar.update(committed - last_done[2])
+                            merged_pbar.update(merged - last_done[3])
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -166,6 +157,9 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     db_consumer_module.TOTAL_CONSUMERS = args.db_consumers
+    db_consumer_module.BUFFER_PROGRESS = [0] * args.db_consumers
+    db_consumer_module.COMMIT_PROGRESS = [0] * args.db_consumers
+    db_consumer_module.MERGE_PROGRESS = [0] * args.db_consumers
 
     logging.basicConfig(level=getattr(logging, args.debug.upper()), format='%(asctime)s - %(name)s - %(levelname)s: %(message)s')
 
