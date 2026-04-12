@@ -71,7 +71,9 @@ def __create_staging_table(cur, staging_table: str):
     
 def __merge_staging_table(cur, staging_table: str):
     with MERGE_LOCK:
-        with timed("merging", "db"):
+        with timed("merging", "db", log=True):
+            cur.execute(f"ANALYZE tx_{staging_table}")
+            cur.execute(f"ANALYZE tf_{staging_table}")
             cur.execute(f"""
                             INSERT INTO transactions (id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee)
                             SELECT id, result, ts, transaction_t::transaction_type, fee_limit, fee, energy_usage, net_fee

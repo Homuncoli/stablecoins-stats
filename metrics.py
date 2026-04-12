@@ -97,7 +97,7 @@ TIMING = {
 
 
 @contextmanager
-def timed(name: str, space: str = "default"):
+def timed(name: str, space: str = "default", log: bool = False):
     if not TIMING_ENABLED:
         yield
         return
@@ -108,7 +108,10 @@ def timed(name: str, space: str = "default"):
     finally:
         if space not in TIMING:
             TIMING[space] = TimingRegistry()
-        TIMING[space].record(name, time.perf_counter_ns() - start)
+        end = time.perf_counter_ns()
+        TIMING[space].record(name, end - start)
+        if log:
+            logging.info("Timing: %s [%s] took %.3f s", name, space, (end - start) / 1_000_000_000)
 
 def log_timings():
     if TIMING_ENABLED:
