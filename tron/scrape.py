@@ -24,6 +24,7 @@ from metrics import timed
 
 SCALER = 1_000
 SCRAPE_PROGRESS = []
+TRANSACTION_COUNT = []
 
 def __pair_transactions_with_infos(block, infos):
     info_by_txid = { info.id.hex(): info for info in infos.transactionInfo }
@@ -269,6 +270,7 @@ def __scrape_block(stub: tron_api.WalletStub, block_num: int, logger: logging.Lo
 
         TRON_QUEUE.put(block_data)
         SCRAPE_PROGRESS[chunk_id] += 1
+        TRANSACTION_COUNT[chunk_id] += len(block_data)
 
     except Exception as e:
         logger.error("error processing block %d", block_num, exc_info=e)

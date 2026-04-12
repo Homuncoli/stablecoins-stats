@@ -13,9 +13,7 @@ from model.Tron import TRON_QUEUE, TransactionDTO, TransferDTO
 
 MERGE_LOCK = threading.Lock()
 DB_SYNC_LOCK = threading.Lock()
-DB_NEXT_SYNC = 0
 TOTAL_CONSUMERS = 0
-TX_LIMIT = 1_000_000
 
 BUFFER_PROGRESS = []
 COMMIT_PROGRESS = []
@@ -38,6 +36,10 @@ def __next_merge_target(base_merge_size: int, rng: random.Random) -> int:
     return max(1, base + rng.randint(-jitter, jitter))
 
 def __create_staging_table(cur, staging_table: str):
+    cur.execute(f"""
+                    SET temp_buffers TO '8GB';
+                    SET work_mem TO '4GB';
+                """)
     cur.execute(f"""
                     CREATE TEMP TABLE tx_{staging_table} (
                         id bigint,
@@ -102,15 +104,25 @@ def __merge_staging_table(cur, staging_table: str):
                         """)
             cur.execute(f"""
                             INSERT INTO transfers (transaction, index, token, value_lo, value_hi, from_addr, to_addr, success)
-                            SELECT s.transaction, s.index, COALESCE(t.id, 0), s.value_lo, s.value_hi, from_a.id, to_a.id, s.success
+                            SELECT 
+                              s.transaction,
+                              s.index,
+                              COALESCE(t1.id, t2.id, 0),
+                              s.value_lo,
+                              s.value_hi,
+                              from_a.id,
+                              to_a.id,
+                              s.success
                             FROM tf_{staging_table} s
-                            LEFT JOIN addresses from_a ON s.from_addr = from_a.addr
-                            LEFT JOIN addresses to_a ON s.to_addr = to_a.addr
-                            LEFT JOIN addresses token_a ON s.token_contract_addr = token_a.addr
-                            LEFT JOIN tokens t ON (s.token_contract_addr IS NOT NULL AND token_a.id = t.contract_addr) OR (s.token_asset_id IS NOT NULL AND s.token_asset_id = t.asset_id)
-                            ON CONFLICT (transaction, index) DO NOTHING
+                            LEFT JOIN addresses from_a  ON s.from_addr            = from_a.addr
+                            LEFT JOIN addresses to_a    ON s.to_addr              = to_a.addr
+                            LEFT JOIN addresses token_a ON s.token_contract_addr  = token_a.addr
+                            LEFT JOIN tokens t1         ON s.token_contract_addr IS NOT NULL 
+                                                       AND token_a.id             = t1.contract_addr
+                            LEFT JOIN tokens t2         ON s.token_asset_id IS NOT NULL 
+                                                       AND s.token_asset_id       = t2.asset_id
+                            ON CONFLICT (transaction, index) DO NOTHING;
                         """)
-            # Keep merge work bounded: each batch should be merged exactly once.
             cur.execute(f"TRUNCATE TABLE tx_{staging_table}, tf_{staging_table}")
 
 
@@ -147,6 +159,7 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
 
     try:
         with pool.connection() as conn:
+            conn.execute(f"SET application_name TO 'db_consumer_{consumer_id}';")
             with conn.cursor() as cur:
                 __create_staging_table(cur, staging_table)
                 tx_copy_types = ["int8", "bool", "timestamp", "text", "int8", "int8", "int8", "int8"]
@@ -216,23 +229,25 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
                     finally:
                         pass
 
-                    if uncommited_tx == 0 or (not force and uncommited_tx < commit_target):
+                    if uncommited_tx == 0:
                         return False
 
-                    if not DB_NEXT_SYNC == consumer_id and not force:
+                    if not DB_SYNC_LOCK.acquire(blocking=force):
                         return False
                     
-                    if uncommited_tx > 0 and (force or uncommited_tx >= merge_target):
-                        logger.debug("merging staging table after processing %d transactions", uncommited_tx)
-                        __merge_staging_table_with_retry(cur, staging_table, logger)
-                        with timed("commit", "db"):
-                            conn.commit()
-                        MERGE_PROGRESS[consumer_id] += uncommited_tx
-                        uncommited_tx = 0
-                        merge_target = __next_merge_target(merge_size, rng)
-                        logger.debug("next randomized merge size set to %d transactions", merge_target)
-                    DB_NEXT_SYNC = (DB_NEXT_SYNC + 1) % TOTAL_CONSUMERS
-                    return True
+                    try:
+                        if uncommited_tx > 0:
+                            logger.info("merging staging table after processing %d transactions", uncommited_tx)
+                            __merge_staging_table_with_retry(cur, staging_table, logger)
+                            with timed("commit", "db"):
+                                conn.commit()
+                            MERGE_PROGRESS[consumer_id] += uncommited_tx
+                            uncommited_tx = 0
+                            merge_target = __next_merge_target(merge_size, rng)
+                            logger.debug("next randomized merge size set to %d transactions", merge_target)
+                        return True
+                    finally:                        
+                        DB_SYNC_LOCK.release()
 
                 while True:
                     with timed("queue", "db"):
@@ -260,7 +275,10 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
                             TRON_QUEUE.task_done()
 
                     # Only one consumer may sync with DB at a time; others continue draining the queue.
-                    sync_staging(force=len(tx_buffer) > TX_LIMIT)
+                    force = tx_buffer_rows > merge_target
+                    if force:
+                        logger.debug("force syncing staging table due to buffer size %d exceeding merge target %d", tx_buffer_rows, merge_target)
+                    sync_staging(force=force)
 
                 if tx_buffer_rows > 0 or uncommited_tx > 0:
                     logger.info("stopping, flushing remaining buffers to DB")

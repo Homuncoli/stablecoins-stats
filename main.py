@@ -21,7 +21,7 @@ from concurrent.futures import wait, FIRST_COMPLETED
 
 import grpc
 from metrics import TIMING, log_timings
-from model.Tron import TRON_QUEUE
+from model.Tron import TRON_QUEUE, TRON_QUEUE_SIZE
 from tron import scrape as tron
 import tron.db_consumer as db_consumer_module
 
@@ -39,7 +39,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 TIMEOUT = 1.0
 QUEUE_HISTORY_LIMIT = 15
-PROGRESS_BAR_FORMAT = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+PROGRESS_BAR_FORMAT = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}"
 
 def get_now_block(STUB) -> int:
     return STUB.GetNowBlock(api.EmptyMessage()).block_header.raw_data.number
@@ -117,12 +117,20 @@ def monitor_metrics(db_stop, stop_event: threading.Event, args, rpc_futures: lis
                                 if len(queue_history) > QUEUE_HISTORY_LIMIT:
                                     del queue_history[:-QUEUE_HISTORY_LIMIT]
                                 if len(queue_history) >= 2:
-                                    tqdm.write(render_queue_chart(queue_history))
+                                    #tqdm.write(render_queue_chart(queue_history))
+                                    pass
 
                                 scrape_pbar.update(scraped - last_done[0])
                                 buffered_pbar.update(buffered - last_done[1])
+                                buffered_pbar.set_postfix_str(f"queue={current_queue_size / TRON_QUEUE_SIZE:.0%}")
+
+                                total_transactions = sum(tron.TRANSACTION_COUNT)
+                                committed_pbar.total = total_transactions
+                                merged_pbar.total = total_transactions
                                 committed_pbar.update(committed - last_done[2])
                                 merged_pbar.update(merged - last_done[3])
+                                committed_pbar.refresh()
+                                merged_pbar.refresh()
                                 
                                 last_done = [scraped, buffered, committed, merged]
                                 time.sleep(interval)
@@ -192,6 +200,7 @@ if __name__ == "__main__":
         chunks = get_chunks(STUB, args.start, args.end, args.chunk_size)
 
         tron.SCRAPE_PROGRESS = [0] * len(chunks)
+        tron.TRANSACTION_COUNT = [0] * len(chunks)
 
         rpc_futures = []
         rpc_stop = threading.Event()

@@ -72,4 +72,5 @@ create table if not exists logs (
 	
 	primary key (transaction, index)
 );
+
 commit;
