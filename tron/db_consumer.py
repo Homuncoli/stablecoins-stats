@@ -277,9 +277,9 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
                             TRON_QUEUE.task_done()
 
                     # Only one consumer may sync with DB at a time; others continue draining the queue.
-                    force = tx_buffer_rows > merge_target
+                    force = uncommited_tx > merge_target
                     if force:
-                        logger.debug("force syncing staging table due to buffer size %d exceeding merge target %d", tx_buffer_rows, merge_target)
+                        logger.debug("force syncing staging table due to buffer size %d exceeding merge target %d", uncommited_tx, merge_target)
                     sync_staging(force=force)
 
                 if tx_buffer_rows > 0 or uncommited_tx > 0:
