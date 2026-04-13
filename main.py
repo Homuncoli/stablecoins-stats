@@ -74,7 +74,7 @@ def monitor_metrics(db_stop, stop_event: threading.Event, args, rpc_futures: lis
     queue_size_total = 0
     queue_size_samples = 0
     queue_history: list[int] = []
-    SMOOTHING = 1.0
+    SMOOTHING = 0.7
     with logging_redirect_tqdm():
         with tqdm(
             total=args.chunk_size * len(rpc_futures),

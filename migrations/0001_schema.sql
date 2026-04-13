@@ -41,7 +41,7 @@ create table if not exists transactions (
 	fee bigint,
 	energy_usage bigint,
 	net_fee bigint
-);
+) partition by range (id);
 
 create table if not exists transfers (
 	transaction bigint not null references transactions(id),
@@ -55,7 +55,7 @@ create table if not exists transfers (
 	success bool,
 	
 	primary key (transaction, index)
-);
+) partition by range (transaction);
 
 
 -- All NOT transfer logs
@@ -72,5 +72,35 @@ create table if not exists logs (
 	
 	primary key (transaction, index)
 );
+
+DO $$
+DECLARE
+    i bigint;
+    partition_start bigint;
+    partition_end bigint;
+    transactions_name text;
+	transfers_name text;
+BEGIN
+    FOR i IN 0..80 LOOP
+		partition_start := i::bigint * 1000000000::bigint;
+		partition_end   := (i::bigint + 1::bigint) * 1000000000::bigint;
+        transactions_name  := 'transactions_p' || i;
+		transfers_name  := 'transfers_p' || i;
+
+        EXECUTE format(
+            'CREATE TABLE %I PARTITION OF transactions FOR VALUES FROM (%L) TO (%L)',
+            transactions_name,
+            partition_start,
+            partition_end
+        );
+		EXECUTE format(
+            'CREATE TABLE %I PARTITION OF transfers FOR VALUES FROM (%L) TO (%L)',
+            transfers_name,
+            partition_start,
+            partition_end
+        );
+    END LOOP;
+END;
+$$;
 
 commit;

@@ -219,6 +219,7 @@ def __transfer_asset_contract(block, trx, i, info, transfer_asset, logger: loggi
 
 
 def __custom_contract(block, trx, i, info, custom, logger: logging.Logger) -> tuple[TransactionDTO, list[TransferDTO]]:
+    logger.warning("skipping custom contract in block %d", block.block_header.raw_data.number)
     pass
 
 def __parse_transaction(block, trx, i, info, logger: logging.Logger) -> tuple[TransactionDTO, list[TransferDTO]] | tuple[None, None]:
