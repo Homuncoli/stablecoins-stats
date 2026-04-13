@@ -8,7 +8,7 @@ import psycopg
 from psycopg_pool import ConnectionPool
 
 from metrics import timed
-from model.Tron import TF_COPY_TYPES, TRON_QUEUE, TX_COPY_TYPES, TransactionDTO, TransferDTO, to_tf_binary_row, to_tx_binary_row
+from model.Tron import TRON_QUEUE, TX_COPY_TYPES, to_tx_binary_row
 
 MERGE_LOCK = threading.Lock()
 DB_SYNC_LOCK = threading.Lock()
@@ -18,16 +18,205 @@ BUFFER_PROGRESS = []
 COMMIT_PROGRESS = []
 MERGE_PROGRESS = []
 
-def __copy_binary_to_staging_table(cur, buffer: list[tuple], staging_table: str, columns: str, type_names: list[str]):
+
+def __load_address_lookup(cur) -> tuple[dict[bytes, int], int]:
+    address_lookup: dict[bytes, int] = {}
+    last_address_id = 0
+
+    cur.execute("SELECT id, addr FROM addresses ORDER BY id")
+    for address_id, address in cur:
+        address_lookup[address] = address_id
+        if address_id > last_address_id:
+            last_address_id = address_id
+
+    return address_lookup, last_address_id
+
+
+def __refresh_address_lookup(cur, address_lookup: dict[bytes, int], last_address_id: int) -> int:
+    cur.execute("SELECT id, addr FROM addresses WHERE id > %s ORDER BY id", (last_address_id,))
+    for address_id, address in cur:
+        address_lookup[address] = address_id
+        if address_id > last_address_id:
+            last_address_id = address_id
+
+    return last_address_id
+
+
+def __load_token_lookup(cur) -> tuple[dict[int, int], dict[int, int], int]:
+    token_lookup_by_contract: dict[int, int] = {}
+    token_lookup_by_asset: dict[int, int] = {}
+    last_token_id = 0
+
+    cur.execute("SELECT id, asset_id, contract_addr FROM tokens ORDER BY id")
+    for token_id, asset_id, contract_addr in cur:
+        if asset_id is not None:
+            token_lookup_by_asset[asset_id] = token_id
+        if contract_addr is not None:
+            token_lookup_by_contract[contract_addr] = token_id
+        if token_id > last_token_id:
+            last_token_id = token_id
+
+    return token_lookup_by_contract, token_lookup_by_asset, last_token_id
+
+
+def __refresh_token_lookup(cur, token_lookup_by_contract: dict[int, int], token_lookup_by_asset: dict[int, int], last_token_id: int) -> int:
+    cur.execute("SELECT id, asset_id, contract_addr FROM tokens WHERE id > %s ORDER BY id", (last_token_id,))
+    for token_id, asset_id, contract_addr in cur:
+        if asset_id is not None:
+            token_lookup_by_asset[asset_id] = token_id
+        if contract_addr is not None:
+            token_lookup_by_contract[contract_addr] = token_id
+        if token_id > last_token_id:
+            last_token_id = token_id
+
+    return last_token_id
+
+
+def __copy_binary_rows(cur, buffer: list[tuple], target_table: str, columns: str, type_names: list[str]):
     if not buffer:
         return
 
     with timed("copy_binary", "db"):
-        with cur.copy(f"COPY {staging_table} ({columns}) FROM STDIN WITH (FORMAT BINARY)") as copy:
+        with cur.copy(f"COPY {target_table} ({columns}) FROM STDIN WITH (FORMAT BINARY)") as copy:
             copy.set_types(type_names)
             for row in buffer:
                 copy.write_row(row)
 
+
+def __collect_address_rows(tf_rows: list[tuple]) -> dict[bytes, str]:
+    address_rows: dict[bytes, str] = {}
+
+    for transfer in tf_rows:
+        token_contract_addr = transfer[3]
+        from_addr = transfer[7]
+        from_type = transfer[8]
+        to_addr = transfer[9]
+        to_type = transfer[10]
+
+        if from_addr is not None and from_addr not in address_rows:
+            address_rows[from_addr] = from_type
+        if to_addr is not None and to_addr not in address_rows:
+            address_rows[to_addr] = to_type
+        if token_contract_addr is not None and token_contract_addr not in address_rows:
+            address_rows[token_contract_addr] = "Contract"
+
+    return address_rows
+
+
+def __insert_addresses(cur, address_rows: dict[bytes, str], address_lookup: dict[bytes, int], last_address_id: int) -> int:
+    rows = [(address, address_t) for address, address_t in address_rows.items() if address not in address_lookup]
+    if not rows:
+        return last_address_id
+
+    addresses = [row[0] for row in rows]
+    address_types = [row[1] for row in rows]
+    cur.execute(
+        """
+            INSERT INTO addresses (addr, addr_t)
+            SELECT DISTINCT addr, addr_t::addr_type
+            FROM unnest(%s::bytea[], %s::text[]) AS t(addr, addr_t)
+            ON CONFLICT (addr) DO NOTHING
+        """,
+        (addresses, address_types),
+    )
+
+    last_address_id = __refresh_address_lookup(cur, address_lookup, last_address_id)
+
+    return last_address_id
+
+
+def __insert_tokens(
+    cur,
+    tf_rows: list[tuple],
+    address_lookup: dict[bytes, int],
+    token_lookup_by_contract: dict[int, int],
+    token_lookup_by_asset: dict[int, int],
+    last_token_id: int,
+) -> int:
+    rows: list[tuple[int | None, int | None, str]] = []
+    seen: set[tuple[int | None, int | None]] = set()
+
+    for transfer in tf_rows:
+        token_asset_id = transfer[2]
+        token_contract_addr = transfer[3]
+        token_t = transfer[4]
+
+        contract_id = address_lookup.get(token_contract_addr) if token_contract_addr is not None else None
+        if contract_id is None and token_asset_id is None:
+            continue
+        if contract_id is not None and contract_id in token_lookup_by_contract:
+            continue
+        if token_asset_id is not None and token_asset_id in token_lookup_by_asset:
+            continue
+
+        key = (contract_id, token_asset_id)
+        if key in seen:
+            continue
+
+        seen.add(key)
+        rows.append((contract_id, token_asset_id, token_t))
+
+    if not rows:
+        return last_token_id
+
+    contract_addrs = [row[0] for row in rows]
+    asset_ids = [row[1] for row in rows]
+    token_types = [row[2] for row in rows]
+    cur.execute(
+        """
+            INSERT INTO tokens (contract_addr, asset_id, token_t)
+            SELECT DISTINCT contract_addr, asset_id, token_t::token_type
+            FROM unnest(%s::bigint[], %s::bigint[], %s::text[]) AS t(contract_addr, asset_id, token_t)
+            ON CONFLICT DO NOTHING
+        """,
+        (contract_addrs, asset_ids, token_types),
+    )
+
+    last_token_id = __refresh_token_lookup(cur, token_lookup_by_contract, token_lookup_by_asset, last_token_id)
+
+    return last_token_id
+
+
+def __collect_transfer_rows(
+    tf_rows: list[tuple],
+    address_lookup: dict[bytes, int],
+    token_lookup_by_contract: dict[int, int],
+    token_lookup_by_asset: dict[int, int],
+) -> list[tuple]:
+    transfer_rows: list[tuple] = []
+
+    for transfer in tf_rows:
+        transaction = transfer[0]
+        index = transfer[1]
+        token_asset_id = transfer[2]
+        token_contract_addr = transfer[3]
+        value_lo = transfer[5]
+        value_hi = transfer[6]
+        from_addr = transfer[7]
+        to_addr = transfer[9]
+        success = transfer[11]
+
+        token_id = 0
+        if token_contract_addr is not None:
+            contract_id = address_lookup[token_contract_addr]
+            token_id = token_lookup_by_contract.get(contract_id, 0)
+        if token_id == 0 and token_asset_id is not None:
+            token_id = token_lookup_by_asset.get(token_asset_id, 0)
+
+        transfer_rows.append(
+            (
+                transaction,
+                index,
+                token_id,
+                value_lo,
+                value_hi,
+                address_lookup[from_addr],
+                address_lookup[to_addr],
+                success,
+            )
+        )
+
+    return transfer_rows
 
 def __next_merge_target(base_merge_size: int, rng: random.Random) -> int:
     base = max(1, base_merge_size)
@@ -51,73 +240,17 @@ def __create_staging_table(cur, staging_table: str):
                         net_fee bigint
                     )
                 """)
-    cur.execute(f"""
-                    CREATE TEMP TABLE tf_{staging_table} (
-                        transaction bigint,
-                        index smallint,
-                        token_asset_id bigint,
-                        token_contract_addr bytea,
-                        token_t text,
-                        value_lo bigint,
-                        value_hi bigint,
-                        from_addr bytea,
-                        from_type text,
-                        to_addr bytea,
-                        to_type text,
-                        success bool
-                    )
-                """)
-    
+
 def __merge_staging_table(cur, staging_table: str):
-        with timed("merging", "db", log=True):
-            cur.execute(f"ANALYZE tx_{staging_table}")
-            cur.execute(f"ANALYZE tf_{staging_table}")
-            cur.execute(f"""
-                            INSERT INTO transactions (id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee)
-                            SELECT id, result, ts, transaction_t::transaction_type, fee_limit, fee, energy_usage, net_fee
-                            FROM tx_{staging_table}
-                            ON CONFLICT (id) DO NOTHING
-                        """)
-            cur.execute(f"""
-                            INSERT INTO addresses (addr, addr_t)
-                            SELECT DISTINCT addr, addr_t FROM (
-                                SELECT from_addr AS addr, from_type::addr_type AS addr_t FROM tf_{staging_table} WHERE from_addr IS NOT NULL
-                                UNION
-                                SELECT to_addr, to_type::addr_type FROM tf_{staging_table} WHERE to_addr IS NOT NULL
-                                UNION
-                                SELECT token_contract_addr, 'Contract'::addr_type FROM tf_{staging_table} WHERE token_contract_addr IS NOT NULL
-                            ) combined
-                            ORDER BY addr
-                            ON CONFLICT (addr) DO NOTHING
-                        """)
-            cur.execute(f"""
-                            INSERT INTO tokens (contract_addr, asset_id, token_t)
-                            SELECT DISTINCT a.id, s.token_asset_id, s.token_t::token_type FROM tf_{staging_table} s
-                                LEFT JOIN addresses a ON s.token_contract_addr = a.addr
-                            ON CONFLICT DO NOTHING
-                        """)
-            cur.execute(f"""
-                            INSERT INTO transfers (transaction, index, token, value_lo, value_hi, from_addr, to_addr, success)
-                            SELECT 
-                              s.transaction,
-                              s.index,
-                              COALESCE(t1.id, t2.id, 0),
-                              s.value_lo,
-                              s.value_hi,
-                              from_a.id,
-                              to_a.id,
-                              s.success
-                            FROM tf_{staging_table} s
-                            LEFT JOIN addresses from_a  ON s.from_addr            = from_a.addr
-                            LEFT JOIN addresses to_a    ON s.to_addr              = to_a.addr
-                            LEFT JOIN addresses token_a ON s.token_contract_addr  = token_a.addr
-                            LEFT JOIN tokens t1         ON s.token_contract_addr IS NOT NULL 
-                                                       AND token_a.id             = t1.contract_addr
-                            LEFT JOIN tokens t2         ON s.token_asset_id IS NOT NULL 
-                                                       AND s.token_asset_id       = t2.asset_id
-                            ON CONFLICT (transaction, index) DO NOTHING;
-                        """)
-            cur.execute(f"TRUNCATE TABLE tx_{staging_table}, tf_{staging_table}")
+    with timed("merging", "db"):
+        cur.execute(f"ANALYZE tx_{staging_table}")
+        cur.execute(f"""
+                        INSERT INTO transactions (id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee)
+                        SELECT id, result, ts, transaction_t::transaction_type, fee_limit, fee, energy_usage, net_fee
+                        FROM tx_{staging_table}
+                        ON CONFLICT (id) DO NOTHING
+                    """)
+        cur.execute(f"TRUNCATE TABLE tx_{staging_table}")
 
 
 def __merge_staging_table_with_retry(cur, staging_table: str, logger: logging.Logger, retries: int = 3):
@@ -155,44 +288,82 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
         with pool.connection() as conn:
             conn.execute(f"SET application_name TO 'db_consumer_{consumer_id}';")
             with conn.cursor() as cur:
+                address_lookup, last_address_id = __load_address_lookup(cur)
+                token_lookup_by_contract, token_lookup_by_asset, last_token_id = __load_token_lookup(cur)
                 __create_staging_table(cur, staging_table)
 
                 uncommited_tx = 0
 
                 def sync_staging(force: bool) -> bool:
-                    nonlocal uncommited_tx, tx_buffer_rows
-                    
-                    try:
-                        if tx_buffer_rows > 0 and (force or tx_buffer_rows >= commit_size):
+                        nonlocal uncommited_tx, tx_buffer_rows, last_address_id, last_token_id
+                        should_flush_new_rows = tx_buffer_rows > 0 and (force or tx_buffer_rows >= commit_size)
+    
+                        if not should_flush_new_rows and uncommited_tx == 0:
+                            return False
+    
+                        tx_rows = tx_buffer.copy() if should_flush_new_rows else []
+                        tf_rows = tf_buffer.copy() if should_flush_new_rows else []
+    
+                        if should_flush_new_rows:
                             logger.debug("copying binary buffers to staging after processing %d transactions", tx_buffer_rows)
-                            __copy_binary_to_staging_table(cur, tx_buffer, f"tx_{staging_table}", "id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee", TX_COPY_TYPES)
-                            __copy_binary_to_staging_table(cur, tf_buffer, f"tf_{staging_table}", "transaction, index, token_asset_id, token_contract_addr, token_t, value_lo, value_hi, from_addr, from_type, to_addr, to_type, success", TF_COPY_TYPES)
+                            __copy_binary_rows(cur, tx_rows, f"tx_{staging_table}", "id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee", TX_COPY_TYPES)
                             uncommited_tx += tx_buffer_rows
                             COMMIT_PROGRESS[consumer_id] += tx_buffer_rows
-                            tx_buffer.clear()
-                            tf_buffer.clear()
-                            tx_buffer_rows = 0
-                    finally:
-                        pass
-
-                    if uncommited_tx == 0:
-                        return False
-                    
-                    if not DB_SYNC_LOCK.acquire():
-                        return False
-
-                    try:
-                        if uncommited_tx > 0:
-                            logger.info("merging staging table after processing %d transactions", uncommited_tx)
-                            __merge_staging_table_with_retry(cur, staging_table, logger)
-                            with timed("commit", "db"):
-                                conn.commit()
-                            MERGE_PROGRESS[consumer_id] += uncommited_tx
-                            uncommited_tx = 0
-                            logger.debug("next randomized merge size set to %d transactions", merge_size)
-                        return True
-                    finally:
-                        DB_SYNC_LOCK.release()
+    
+                        if uncommited_tx == 0:
+                            return False
+    
+                        if not DB_SYNC_LOCK.acquire():
+                            return False
+    
+                        try:
+                            if uncommited_tx > 0:
+                                logger.info("merging staging table after processing %d transactions", uncommited_tx)
+                                __merge_staging_table_with_retry(cur, staging_table, logger)
+    
+                                if tf_rows:
+                                    last_address_id = __refresh_address_lookup(cur, address_lookup, last_address_id)
+                                    last_token_id = __refresh_token_lookup(cur, token_lookup_by_contract, token_lookup_by_asset, last_token_id)
+    
+                                    address_rows = __collect_address_rows(tf_rows)
+                                    last_address_id = __insert_addresses(cur, address_rows, address_lookup, last_address_id)
+                                    last_token_id = __insert_tokens(
+                                        cur,
+                                        tf_rows,
+                                        address_lookup,
+                                        token_lookup_by_contract,
+                                        token_lookup_by_asset,
+                                        last_token_id,
+                                    )
+    
+                                    transfer_rows = __collect_transfer_rows(
+                                        tf_rows,
+                                        address_lookup,
+                                        token_lookup_by_contract,
+                                        token_lookup_by_asset,
+                                    )
+                                    __copy_binary_rows(
+                                        cur,
+                                        transfer_rows,
+                                        "transfers",
+                                        "transaction, index, token, value_lo, value_hi, from_addr, to_addr, success",
+                                        ["int8", "int2", "int4", "int8", "int8", "int8", "int8", "bool"],
+                                    )
+    
+                                with timed("commit", "db"):
+                                    conn.commit()
+    
+                                if should_flush_new_rows:
+                                    tx_buffer.clear()
+                                    tf_buffer.clear()
+                                    tx_buffer_rows = 0
+    
+                                MERGE_PROGRESS[consumer_id] += uncommited_tx
+                                uncommited_tx = 0
+                                logger.debug("next randomized merge size set to %d transactions", merge_size)
+                            return True
+                        finally:
+                            DB_SYNC_LOCK.release()
 
                 while True:
                     with timed("queue", "db"):
@@ -213,7 +384,7 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
                             for tx, tfs in block_data:
                                 tx_buffer.append(to_tx_binary_row(tx))
                                 for tf in tfs:
-                                    tf_buffer.append(to_tf_binary_row(tf))
+                                    tf_buffer.append(tf)
                             tx_buffer_rows += len([tx for tx, _ in block_data])
                             BUFFER_PROGRESS[consumer_id] += 1
                         finally:

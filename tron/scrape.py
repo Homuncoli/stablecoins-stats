@@ -22,7 +22,7 @@ from tron.generated.core.contract import smart_contract_pb2
 
 from metrics import timed
 
-SCALER = 1_000
+SCALER = 10_000
 SCRAPE_PROGRESS = []
 TRANSACTION_COUNT = []
 
@@ -52,7 +52,7 @@ def __transfer_log_to_transfer_dto(id, j, trx, info, log, smart, logger):
         "Unknown",
         to_address,
         "Unknown",
-        not bool(trx.ret[0].contractRet == protocol.Transaction.Result.SUCCESS)
+        bool(trx.ret[0].contractRet == protocol.Transaction.Result.SUCCESS)
     )
 
 LOG_TO_TRANSFER = {
