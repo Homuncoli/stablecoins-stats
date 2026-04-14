@@ -129,9 +129,9 @@ def monitor_metrics(db_stop, stop_event: threading.Event, args, rpc_futures: lis
                                 merged_pbar.total = total_transactions
 
                                 committed_pbar.update(committed - last_done[2])
-                                tqdm.write(f"Addresses: {db_consumer_module.ADDRESS_LOOKUP[0]}|{db_consumer_module.ADDRESS_LOOKUP[1]} Tokens: {db_consumer_module.TOKEN_LOOKUP[0]}|{db_consumer_module.TOKEN_LOOKUP[1]}")
-                                committed_pbar.set_postfix_str(f"addr={sum(db_consumer_module.ADDRESS_LOOKUP)/len(db_consumer_module.ADDRESS_LOOKUP):.0f} token={sum(db_consumer_module.TOKEN_LOOKUP)/len(db_consumer_module.TOKEN_LOOKUP):.0f}")
+                                committed_pbar.set_postfix_str(f"addr={len(db_consumer_module.SHARED_ADDRESS_LOOKUP)} token={len(db_consumer_module.SHARED_TOKEN_LOOKUP_BY_CONTRACT) + len(db_consumer_module.SHARED_TOKEN_LOOKUP_BY_ASSET)}")
                                 merged_pbar.update(merged - last_done[3])
+                                merged_pbar.set_postfix_str(",".join([f"uncommitted={uncommited / args.merge_size:.0%}" for uncommited in db_consumer_module.UNCOMMITTED_TRANSACTIONS]))
 
                                 committed_pbar.refresh()
                                 merged_pbar.refresh()
@@ -172,8 +172,8 @@ if __name__ == "__main__":
     db_consumer_module.BUFFER_PROGRESS = [0] * args.db_consumers
     db_consumer_module.COMMIT_PROGRESS = [0] * args.db_consumers
     db_consumer_module.MERGE_PROGRESS = [0] * args.db_consumers
-    db_consumer_module.ADDRESS_LOOKUP = [0] * args.db_consumers
-    db_consumer_module.TOKEN_LOOKUP = [0] * args.db_consumers
+    db_consumer_module.DB_STATE = ["INIT"] * args.db_consumers
+    db_consumer_module.UNCOMMITTED_TRANSACTIONS = [0] * args.db_consumers
 
     logging.basicConfig(level=getattr(logging, args.debug.upper()), format='%(asctime)s - %(name)s - %(levelname)s: %(message)s')
 

@@ -90,7 +90,7 @@ class TimingRegistry:
         return lines
 
 
-TIMING_ENABLED = True
+TIMING_ENABLED = False
 TIMING = {
     "default": TimingRegistry()
 }
