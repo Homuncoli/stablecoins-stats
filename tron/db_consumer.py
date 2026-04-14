@@ -18,6 +18,9 @@ BUFFER_PROGRESS = []
 COMMIT_PROGRESS = []
 MERGE_PROGRESS = []
 
+ADDRESS_LOOKUP = []
+TOKEN_LOOKUP = []
+
 
 def __load_address_lookup(cur) -> tuple[dict[bytes, int], int]:
     address_lookup: dict[bytes, int] = {}
@@ -240,6 +243,18 @@ def __create_staging_table(cur, staging_table: str):
                         net_fee bigint
                     )
                 """)
+    cur.execute(f"""
+                    CREATE TEMP TABLE tf_{staging_table} (
+                        transaction bigint,
+                        index smallint,
+                        token int,
+                        value_lo bigint,
+                        value_hi bigint,
+                        from_addr bigint,
+                        to_addr bigint,
+                        success bool
+                    )
+                """)
 
 def __merge_staging_table(cur, staging_table: str):
     with timed("merging", "db"):
@@ -251,6 +266,18 @@ def __merge_staging_table(cur, staging_table: str):
                         ON CONFLICT (id) DO NOTHING
                     """)
         cur.execute(f"TRUNCATE TABLE tx_{staging_table}")
+
+
+def __merge_transfer_staging_table(cur, staging_table: str):
+    with timed("merging_transfers", "db"):
+        cur.execute(f"ANALYZE tf_{staging_table}")
+        cur.execute(f"""
+                        INSERT INTO transfers (transaction, index, token, value_lo, value_hi, from_addr, to_addr, success)
+                        SELECT transaction, index, token, value_lo, value_hi, from_addr, to_addr, success
+                        FROM tf_{staging_table}
+                        ON CONFLICT (transaction, index) DO NOTHING
+                    """)
+        cur.execute(f"TRUNCATE TABLE tf_{staging_table}")
 
 
 def __merge_staging_table_with_retry(cur, staging_table: str, logger: logging.Logger, retries: int = 3):
@@ -335,7 +362,9 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
                                         token_lookup_by_asset,
                                         last_token_id,
                                     )
-    
+
+                                    ADDRESS_LOOKUP[consumer_id] = len(address_lookup)
+                                    TOKEN_LOOKUP[consumer_id] = len(token_lookup_by_contract) + len(token_lookup_by_asset)
                                     transfer_rows = __collect_transfer_rows(
                                         tf_rows,
                                         address_lookup,
@@ -345,10 +374,11 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
                                     __copy_binary_rows(
                                         cur,
                                         transfer_rows,
-                                        "transfers",
+                                        f"tf_{staging_table}",
                                         "transaction, index, token, value_lo, value_hi, from_addr, to_addr, success",
                                         ["int8", "int2", "int4", "int8", "int8", "int8", "int8", "bool"],
                                     )
+                                    __merge_transfer_staging_table(cur, staging_table)
     
                                 with timed("commit", "db"):
                                     conn.commit()
@@ -360,7 +390,6 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
     
                                 MERGE_PROGRESS[consumer_id] += uncommited_tx
                                 uncommited_tx = 0
-                                logger.debug("next randomized merge size set to %d transactions", merge_size)
                             return True
                         finally:
                             DB_SYNC_LOCK.release()
