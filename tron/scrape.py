@@ -279,6 +279,11 @@ def __scrape_block(stub: tron_api.WalletStub, block_num: int, logger: logging.Lo
 
 def scrape(stub: tron_api.WalletStub, chunk_id: int, chunk_start: int, chunk_end: int, stop_event: threading.Event):
     logger = logging.getLogger(f"rpc-scraper-{chunk_id}")
+
+    if chunk_start > chunk_end:
+        logger.debug("chunk start %d is greater than chunk end %d, skipping", chunk_start, chunk_end)
+        return
+
     logger.debug("scraping for blocks %d to %d", chunk_start, chunk_end)
 
     current = chunk_start

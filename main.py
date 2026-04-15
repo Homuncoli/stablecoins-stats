@@ -166,6 +166,7 @@ if __name__ == "__main__":
     
     ap.add_argument("--profile-timing", action="store_true", help="Enable detailed timing of scraping and database operations")
     ap.add_argument("--metrics", type=int, default=5, help="Interval in seconds to log scraping metrics (blocks/sec, queue sizes, etc.)")
+    ap.add_argument("--proceed", action="store_true", help="Continue from latest block per chunk")
     args = ap.parse_args()
 
     db_consumer_module.TOTAL_CONSUMERS = args.db_consumers
@@ -213,6 +214,26 @@ if __name__ == "__main__":
         db_threads = []
         db_stop_event = threading.Event()
         metrics_stop_event = threading.Event()
+
+        if args.proceed:
+            with psycopg.connect(args.pg) as conn:
+                with conn.cursor() as cur:
+                    for i, (chunk_start, chunk_end) in enumerate(chunks):
+                        cur.execute("SELECT MAX(id / 10000) FROM transactions WHERE id / 10000 >= %s AND id / 10000 <= %s", (chunk_start, chunk_end))
+                        result = cur.fetchone()
+                        if result and result[0]:
+                            last_block = result[0]
+                            if last_block >= chunk_end:
+                                tron.SCRAPE_PROGRESS[i] = chunk_end - chunk_start + 1
+                                tron.TRANSACTION_COUNT[i] = 0
+                                logging.info("Chunk %d-%d already fully scraped (up to block %d), skipping", chunk_start, chunk_end, last_block)
+                                chunks[i] = (chunk_end + 1, chunk_end)
+                            else:
+                                tron.SCRAPE_PROGRESS[i] = last_block - chunk_start + 1
+                                logging.info("Chunk %d-%d already partially scraped (up to block %d), proceeding from there", chunk_start, chunk_end, last_block)
+                                chunks[i] = (last_block + 1, chunk_end)
+                        else:
+                            logging.info("Chunk %d-%d not scraped at all, proceeding from start", chunk_start, chunk_end)
 
         start_time = time.time()
 
