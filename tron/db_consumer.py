@@ -371,6 +371,7 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
     try:
         with pool.connection() as conn:
             conn.execute(f"SET application_name TO 'db_consumer_{consumer_id}';")
+            conn.execute(f"SET synchronous_commit = off;")
             with conn.cursor() as cur:
                 global SHARED_LAST_ADDRESS_ID, SHARED_LAST_TOKEN_ID
                 logger.info("initializing shared lookups")

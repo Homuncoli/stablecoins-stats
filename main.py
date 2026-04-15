@@ -302,12 +302,13 @@ if __name__ == "__main__":
             try:
                 TRON_QUEUE.join()
                 logging.info("All items in queue processed, waiting for database consumer threads to exit...")
+                db_stop_event.set()
                 for thread in db_threads:
                     thread.join()
             except Exception as e:
                 logging.fatal("Fatal error in database consumer threads: %s", e)
-
-            metrics_stop_event.set()
+            finally:
+                metrics_stop_event.set()
 
         log_timings()
 
