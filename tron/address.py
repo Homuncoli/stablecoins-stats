@@ -35,37 +35,43 @@ class AddressStash:
             logger.error(f"Error occurred while initializing address stash:", exc_info=e)
 
     def refresh(self, cur) -> int:
-        with timed("refresh", "stash"), self._state_lock:
-            last_address_id = self._last_address_id
+        with timed("refresh", "stash"):
+            with self._state_lock:
+                last_address_id = self._last_address_id
 
             cur.execute("SELECT id, addr FROM addresses WHERE id > %s ORDER BY id", (last_address_id,))
             rows = cur.fetchall()
 
-            for address_id, address in rows:
-                self._cache[address] = address_id
-                if address_id > self._last_address_id:
-                    self._last_address_id = address_id
-            return self._last_address_id
+            with self._state_lock:
+                for address_id, address in rows:
+                    self._cache[address] = address_id
+                    if address_id > self._last_address_id:
+                        self._last_address_id = address_id
+                return self._last_address_id
 
     def get(self, address: bytes) -> int | None:
         with self._state_lock:
             return self._cache.get(address)
 
     def try_new(self, address: bytes, addr_type: str) -> bool:
-        if address in self._cache:
-            return False
         with self._state_lock:
-            self._new.setdefault(address, addr_type)
-        return True
+            if address in self._cache:
+                return False
+            if address in self._new:
+                return False
+            self._new[address] = addr_type
+            return True
     
-    def commit(self, cur, staging_table, logger) -> int:
+    def new_snapshot(self, logger):
         with self._state_lock:
             if len(self._new) == 0:
                 logger.debug("No new addresses to commit.")
-                return 0
+                return []
             rows = list(self._new.items())
             self._new.clear()
-
+            return rows
+    
+    def commit(self, cur, staging_table, rows, logger) -> int:
         with timed("commit", "stash"):
             cur.execute(f"TRUNCATE TABLE addr_{staging_table}")
 
@@ -82,7 +88,9 @@ class AddressStash:
                     INSERT INTO addresses (addr, addr_t)
                     SELECT addr, addr_t::addr_type
                     FROM addr_{staging_table}
-                    RETURNING id, addr
+                    ON CONFLICT (addr) DO UPDATE
+                    SET addr_t = addresses.addr_t
+                    RETURNING id, addr;
                 """)
 
                 inserted_rows = cur.fetchall()

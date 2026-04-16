@@ -38,23 +38,29 @@ class TokenStash:
             logger.error(f"Error occurred while initializing token stash:", exc_info=e)
 
     def refresh(self, cur) -> int:
-        with timed("refresh", "stash"), self._state_lock:
+        with timed("refresh", "stash"):
+            with self._state_lock:
+                last_token_id = self._last_token_id
+
             cur.execute("""
                         SELECT t.id, t.asset_id, a.addr 
                         FROM tokens t LEFT JOIN addresses a 
                             ON t.contract_addr = a.id
                         WHERE t.id > %s 
 
-                        ORDER BY id""", (self._last_token_id,))
-            for id, asset, contract_addr in cur:
-                if contract_addr:
-                    self.by_address[contract_addr] = id
-                if asset:
-                    self.by_asset_id[asset] = id
-                if id > self._last_token_id:
-                    self._last_token_id = id
+                        ORDER BY id""", (last_token_id,))
+            rows = cur.fetchall()
 
-        return self._last_token_id
+            with self._state_lock:
+                for id, asset, contract_addr in rows:
+                    if contract_addr:
+                        self.by_address[contract_addr] = id
+                    if asset:
+                        self.by_asset_id[asset] = id
+                    if id > self._last_token_id:
+                        self._last_token_id = id
+
+            return self._last_token_id
 
     def get_by_address(self, address: bytes) -> int | None:
         with self._state_lock:
@@ -82,17 +88,18 @@ class TokenStash:
             self._new_unknown_contract.add((address, asset_id, token_type))
             return True
         
-    
-    def commit(self, cur, staging_table, logger) -> int:
+    def new_snapshot(self, logger):
         with self._state_lock:
             if len(self._new) == 0 and len(self._new_unknown_contract) == 0:
                 logger.debug("No new tokens to commit.")
-                return 0
+                return [], []
             rows = [(address, asset_id, token_type) for address, asset_id, token_type in self._new]
             unresolved = [(address, asset_id, token_type) for address, asset_id, token_type in self._new_unknown_contract]
             self._new.clear()
             self._new_unknown_contract.clear()
-        
+            return rows, unresolved
+    
+    def commit(self, cur, staging_table, rows, unresolved, logger) -> int:
         with timed("commit", "stash"):
             for address, asset_id, token_type in unresolved:
                 addr = address_module.ADDRESS_CACHE.get(address)
@@ -114,14 +121,41 @@ class TokenStash:
                 ["bigint", "bigint", "text"],
             )
             
-            with TOKEN_TABLE_LOCK:
+            with TOKEN_TABLE_LOCK, timed("token_insert", "db"):
                 cur.execute(f"""
-                    INSERT INTO tokens (contract_addr, asset_id, token_t)
-                    SELECT s.contract_addr_id, s.asset_id, s.token_type::token_type
-                    FROM token_{staging_table} s
-                    LEFT JOIN addresses a ON a.id = s.contract_addr_id
-                    WHERE s.contract_addr_id IS NULL OR a.id IS NOT NULL
-                    RETURNING id, asset_id, contract_addr
+                    WITH staged AS (
+                        SELECT DISTINCT
+                            s.contract_addr_id,
+                            s.asset_id,
+                            s.token_type
+                        FROM token_{staging_table} s
+                        LEFT JOIN addresses a ON a.id = s.contract_addr_id
+                        WHERE s.contract_addr_id IS NULL OR a.id IS NOT NULL
+                    ),
+                    inserted AS (
+                        INSERT INTO tokens (contract_addr, asset_id, token_t)
+                        SELECT s.contract_addr_id, s.asset_id, s.token_type::token_type
+                        FROM staged s
+                        ON CONFLICT DO NOTHING
+                        RETURNING id, asset_id, contract_addr
+                    ),
+                    existing AS (
+                        SELECT t.id, t.asset_id, t.contract_addr
+                        FROM tokens t
+                        JOIN staged s
+                          ON (
+                            (s.contract_addr_id IS NOT NULL AND t.contract_addr = s.contract_addr_id)
+                            OR
+                            (s.asset_id IS NOT NULL AND t.asset_id = s.asset_id)
+                          )
+                    )
+                    SELECT r.id, r.asset_id, a.addr
+                    FROM (
+                        SELECT id, asset_id, contract_addr FROM inserted
+                        UNION
+                        SELECT id, asset_id, contract_addr FROM existing
+                    ) r
+                    LEFT JOIN addresses a ON a.id = r.contract_addr
                 """)
 
             inserted_rows = cur.fetchall()
@@ -142,8 +176,6 @@ class TokenStash:
             else:
                 logger.debug(f"Inserted {inserted_count} new tokens into the database.")
 
-            self._new.clear()
-            self._new_unknown_contract.clear()
             return inserted_count
         
     def size(self) -> int:

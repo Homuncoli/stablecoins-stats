@@ -20,6 +20,7 @@ import threading
 from concurrent.futures import wait, FIRST_COMPLETED
 
 import grpc
+import metrics
 from metrics import TIMING, log_timings
 from model.Tron import TRON_QUEUE, TRON_QUEUE_SIZE
 from tron import scrape as tron
@@ -194,7 +195,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=getattr(logging, args.debug.upper()), format='%(asctime)s - %(name)s - %(levelname)s: %(message)s')
 
     if args.profile_timing:
-        TIMING_ENABLED = True
+        metrics.TIMING_ENABLED = True
 
     if not args.rpc:
         raise SystemExit("Missing --rpc or RPC_URL")
