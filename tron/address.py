@@ -50,8 +50,8 @@ class AddressStash:
                 return self._last_address_id
 
     def get(self, address: bytes) -> int | None:
-        with self._state_lock:
-            return self._cache.get(address)
+        # Read path is intentionally lock-free for throughput.
+        return self._cache.get(address)
 
     def try_new(self, address: bytes, addr_type: str) -> bool:
         with self._state_lock:

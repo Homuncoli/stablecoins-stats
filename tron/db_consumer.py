@@ -254,31 +254,36 @@ def resolve_tf(tf):
     insert = True
     row = (tf[0], tf[1], 0, tf[5], tf[6], None, None, tf[11])
     if tf[2]: # asset_id
-        if token_module.TOKEN_CACHE.get_by_asset_id(tf[2]) is not None:
-            row = row[:2] + (token_module.TOKEN_CACHE.get_by_asset_id(tf[2]),) + row[3:]
+        token_id_by_asset = token_module.TOKEN_CACHE.get_by_asset_id(tf[2])
+        if token_id_by_asset is not None:
+            row = row[:2] + (token_id_by_asset,) + row[3:]
         else:
             token_module.TOKEN_CACHE.try_new(None, tf[2], tf[4])
             insert = False
     if tf[3]: # contract_addr
-        if token_module.TOKEN_CACHE.get_by_address(tf[3]) is not None:
-            row = row[:2] + (token_module.TOKEN_CACHE.get_by_address(tf[3]),) + row[3:]
+        token_id_by_address = token_module.TOKEN_CACHE.get_by_address(tf[3])
+        if token_id_by_address is not None:
+            row = row[:2] + (token_id_by_address,) + row[3:]
         else:
-            if address_module.ADDRESS_CACHE.get(tf[3]) is not None:
-                token_module.TOKEN_CACHE.try_new(address_module.ADDRESS_CACHE.get(tf[3]), None, tf[4])
+            contract_addr_id = address_module.ADDRESS_CACHE.get(tf[3])
+            if contract_addr_id is not None:
+                token_module.TOKEN_CACHE.try_new(contract_addr_id, None, tf[4])
             else:
                 address_module.ADDRESS_CACHE.try_new(tf[3], "Contract")
                 token_module.TOKEN_CACHE.try_new_unknown_contract(tf[3], tf[2], tf[4])
             insert = False
 
     if tf[7]: # from_addr
-        if address_module.ADDRESS_CACHE.get(tf[7]) is not None:
-            row = row[:5] + (address_module.ADDRESS_CACHE.get(tf[7]),) + row[6:]
+        from_addr_id = address_module.ADDRESS_CACHE.get(tf[7])
+        if from_addr_id is not None:
+            row = row[:5] + (from_addr_id,) + row[6:]
         else:
             address_module.ADDRESS_CACHE.try_new(tf[7], "EOA")
             insert = False
     if tf[9]: # to_addr
-        if address_module.ADDRESS_CACHE.get(tf[9]) is not None:
-            row = row[:6] + (address_module.ADDRESS_CACHE.get(tf[9]),) + row[7:]
+        to_addr_id = address_module.ADDRESS_CACHE.get(tf[9])
+        if to_addr_id is not None:
+            row = row[:6] + (to_addr_id,) + row[7:]
         else:
             address_module.ADDRESS_CACHE.try_new(tf[9], "Unknown")
             insert = False

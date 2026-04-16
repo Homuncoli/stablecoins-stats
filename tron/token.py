@@ -63,12 +63,10 @@ class TokenStash:
             return self._last_token_id
 
     def get_by_address(self, address: bytes) -> int | None:
-        with self._state_lock:
-            return self.by_address.get(address)
+        return self.by_address.get(address)
 
     def get_by_asset_id(self, asset_id: int) -> int | None:
-        with self._state_lock:
-            return self.by_asset_id.get(asset_id)
+        return self.by_asset_id.get(asset_id)
 
     def try_new(self, address: int | None, asset_id: int | None, token_type: str) -> bool:
         with self._state_lock:
