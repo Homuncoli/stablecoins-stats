@@ -1,4 +1,5 @@
 import logging
+import queue
 import random
 import sys
 import time
@@ -9,7 +10,7 @@ import psycopg
 from psycopg_pool import ConnectionPool
 
 from metrics import timed
-from model.Tron import TF_COPY_TYPES, TRON_QUEUE, TX_COPY_TYPES, to_tx_binary_row
+from model.Tron import TF_COPY_TYPES, TX_COPY_TYPES, to_tx_binary_row
 from tron import address as address_module
 from tron import token as token_module
 from db_schema import copy_binary_rows
@@ -206,7 +207,7 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
                     with timed("queue", "db"):
                         DB_STATE[consumer_id] = "QUEUE"
                         try:
-                            block_data = TRON_QUEUE.get(timeout=timeout)
+                            block_data = queue.TRON_QUEUE.get(timeout=timeout)
                         except Empty:
                             if not stop_event.is_set():
                                 logger.warning("timed out")
@@ -233,7 +234,7 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
                             uncommited_blocks += 1
                             BUFFERED_BLOCKS[consumer_id] += 1
                         finally:
-                            TRON_QUEUE.task_done()
+                            queue.TRON_QUEUE.task_done()
 
                     force = unmerged_blocks > merge_size
                     if force:

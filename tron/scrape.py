@@ -3,13 +3,14 @@ from datetime import datetime, timezone
 import hashlib
 import logging
 import os
+import queue
 import sys
 import threading
 from eth_abi import decode
 
 import grpc
 
-from model.Tron import TRON_QUEUE, TransactionDTO, TransferDTO, calc_trxID, extract_len_delimited_field, int_to_lo_hi, sun_to_trx
+from model.Tron import TransactionDTO, TransferDTO, calc_trxID, extract_len_delimited_field, int_to_lo_hi, sun_to_trx
 
 sys.path.insert(0, os.path.abspath('./tron/generated'))
 sys.path.insert(0, os.path.abspath('./'))
@@ -272,7 +273,7 @@ def __scrape_block(stub: tron_api.WalletStub, block_num: int, logger: logging.Lo
                 if tx is not None and tfs is not None:
                     block_data.append((tx, tfs))
 
-        TRON_QUEUE.put(block_data)
+        queue.TRON_QUEUE.put(block_data)
         SCRAPED_BLOCKS[chunk_id] += 1
 
     except Exception as e:

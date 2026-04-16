@@ -1,5 +1,6 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import queue
 import signal
 import sys
 import time
@@ -22,7 +23,6 @@ from concurrent.futures import wait, FIRST_COMPLETED
 import grpc
 import metrics
 from metrics import TIMING, log_timings
-from model.Tron import TRON_QUEUE, TRON_QUEUE_SIZE
 from tron import scrape as tron
 from tron import address as address_module
 import tron.db_consumer as db_consumer_module
@@ -119,7 +119,7 @@ def monitor_metrics(db_stop, stop_event: threading.Event, args, rpc_futures: lis
 
                                 scrape_pbar.update(scraped - last_done[0])
                                 buffered_pbar.update(buffered - last_done[1])
-                                buffered_pbar.set_postfix_str(f"queue={TRON_QUEUE.qsize() / TRON_QUEUE_SIZE:.0%}")
+                                buffered_pbar.set_postfix_str(f"queue={queue.TRON_QUEUE.qsize() / queue.TRON_QUEUE_SIZE:.0%}")
 
                                 committed_pbar.update(committed - last_done[2])
                                 if address_module.ADDRESS_CACHE is not None and token_module.TOKEN_CACHE is not None:
@@ -182,7 +182,11 @@ if __name__ == "__main__":
     ap.add_argument("--profile-timing", action="store_true", help="Enable detailed timing of scraping and database operations")
     ap.add_argument("--metrics", type=int, default=5, help="Interval in seconds to log scraping metrics (blocks/sec, queue sizes, etc.)")
     ap.add_argument("--proceed", action="store_true", help="Continue from latest block per chunk")
+    ap.add_argument("--queue", type=int, default=3000, help="Queue size in blocks")
     args = ap.parse_args()
+
+    queue.TRON_QUEUE_SIZE = args.queue
+    queue.TRON_QUEUE = queue.Queue(maxsize=queue.TRON_QUEUE_SIZE)
 
     db_consumer_module.TOTAL_CONSUMERS = args.db_consumers
     db_consumer_module.BUFFERED_BLOCKS = [0] * args.db_consumers
@@ -317,9 +321,9 @@ if __name__ == "__main__":
             logging.info("RPC scraping completed, waiting for database consumers to finish processing remaining items in queue...")
             db_stop_event.set()
             for _ in range(args.db_consumers):
-                TRON_QUEUE.put(None)
+                queue.TRON_QUEUE.put(None)
             try:
-                TRON_QUEUE.join()
+                queue.TRON_QUEUE.join()
                 logging.info("All items in queue processed, waiting for database consumer threads to exit...")
                 db_stop_event.set()
                 for thread in db_threads:

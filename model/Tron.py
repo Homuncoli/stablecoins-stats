@@ -16,9 +16,6 @@ type TransferDTO = tuple[int, int, bytes, bytes, str, int, int, bytes, str, byte
 TX_COPY_TYPES = ["int8", "bool", "timestamp", "text", "int8", "int8", "int8", "int8"]
 TF_COPY_TYPES = ["int8","int2","int8","int8", "int8", "int8", "int8","bool"]
 
-TRON_QUEUE_SIZE = 3_000
-TRON_QUEUE = queue.Queue[list[tuple[TransactionDTO, list[TransferDTO]]]](TRON_QUEUE_SIZE)
-
 def addr_to_tron(addr: bytes) -> str:
     return base58.b58encode_check(addr).decode()
 
