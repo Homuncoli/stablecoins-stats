@@ -222,7 +222,7 @@ if __name__ == "__main__":
         if args.chunk_size is None:
             args.chunk_size = (args.end - args.start) // args.rpc_workers + 1
 
-        logging.info("Scraping %d blocks (from %d to %d) in %d chunks with chunk size %d => %d RPC workers, %d DB consumers", args.end - args.start + 1, args.start, args.end, (args.end - args.start + 1) // args.chunk_size, args.chunk_size, args.rpc_workers, args.db_consumers)
+        logging.info("Scraping %d blocks (from %d to %d) in %d chunks with chunk size %d => %d RPC workers, %d DB consumers, %d queue size", args.end - args.start + 1, args.start, args.end, (args.end - args.start + 1) // args.chunk_size, args.chunk_size, args.rpc_workers, args.db_consumers, args.queue)
 
         chunks = get_chunks(STUB, args.start, args.end, args.chunk_size)
 
