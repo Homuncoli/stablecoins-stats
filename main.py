@@ -77,9 +77,10 @@ def monitor_metrics(db_stop, stop_event: threading.Event, args, rpc_futures: lis
     queue_size_samples = 0
     queue_history: list[int] = []
     SMOOTHING = 0.7
+    total_blocks = args.chunk_size * len(rpc_futures) - sum(tron.INITIAL_BLOCKS)
     with logging_redirect_tqdm():
         with tqdm(
-            total=args.chunk_size * len(rpc_futures),
+            total=total_blocks,
             unit="blocks",
             desc="Scraped",
             bar_format=PROGRESS_BAR_FORMAT,
@@ -87,21 +88,21 @@ def monitor_metrics(db_stop, stop_event: threading.Event, args, rpc_futures: lis
             leave=True
         ) as scrape_pbar:
             with tqdm(
-                total=args.chunk_size * len(rpc_futures),
+                total=total_blocks,
                 unit="blocks",
                 desc="Buffered",
                 bar_format=PROGRESS_BAR_FORMAT,
                 smoothing=SMOOTHING,
                 leave=True) as buffered_pbar:
                 with tqdm(
-                    total=args.chunk_size * len(rpc_futures),
+                    total=total_blocks,
                     unit="blocks",
                     desc="Committed",
                     bar_format=PROGRESS_BAR_FORMAT,
                     smoothing=SMOOTHING,
                     leave=True) as committed_pbar:
                         with tqdm(
-                            total=args.chunk_size * len(rpc_futures),
+                            total=total_blocks,
                             unit="blocks",
                             desc="Merged",
                             bar_format=PROGRESS_BAR_FORMAT,
@@ -125,7 +126,8 @@ def monitor_metrics(db_stop, stop_event: threading.Event, args, rpc_futures: lis
                                 merged_pbar.update(merged - last_done[3])
                                 total_lookups = sum(db_consumer_module.LOOKUP_HITS) + sum(db_consumer_module.LOOKUP_MISSES)
                                 if total_lookups > 0:
-                                    merged_pbar.set_postfix_str(f"hit:{sum(db_consumer_module.LOOKUP_HITS) / total_lookups:.0%}," + ",".join([f"unmerged={(committed - db_consumer_module.MERGED_BLOCKS[i])  / args.merge_size:.0%}" for i, commited in enumerate(db_consumer_module.COMMITED_BLOCKS)]))
+                                    unmerged = [db_consumer_module.COMMITED_BLOCKS[i] - db_consumer_module.MERGED_BLOCKS[i] for i in range(args.db_consumers)]
+                                    merged_pbar.set_postfix_str(f"hit:{sum(db_consumer_module.LOOKUP_HITS) / total_lookups:.0%}," + ",".join([f"unmerged={unmerged[i]}" for i in range(args.db_consumers)]))
                                 
                                 last_done = [scraped, buffered, committed, merged]
                                 time.sleep(interval)
@@ -139,6 +141,27 @@ def monitor_metrics(db_stop, stop_event: threading.Event, args, rpc_futures: lis
                             buffered_pbar.update(buffered - last_done[1])
                             committed_pbar.update(committed - last_done[2])
                             merged_pbar.update(merged - last_done[3])
+
+def proceed_from_last_block_per_chunk(args, chunks):
+    if args.proceed:
+        with psycopg.connect(args.pg) as conn:
+            with conn.cursor() as cur:
+                for i, (chunk_start, chunk_end) in enumerate(chunks):
+                    cur.execute("SELECT MAX(id / 10000) FROM transactions WHERE id / 10000 >= %s AND id / 10000 <= %s", (chunk_start, chunk_end))
+                    result = cur.fetchone()
+                    if result and result[0]:
+                        last_block = result[0]
+                        if last_block >= chunk_end:
+                            tron.INITIAL_BLOCKS[i] += chunk_end - chunk_start + 1
+                            logging.info("Chunk %d-%d already fully scraped (up to block %d), skipping", chunk_start, chunk_end, last_block)
+                            chunks[i] = (chunk_end + 1, chunk_end)
+                        else:
+                            tron.INITIAL_BLOCKS[i] += last_block - chunk_start + 1
+                            logging.info("Chunk %d-%d already partially scraped (up to block %d), proceeding from there", chunk_start, chunk_end, last_block)
+                            chunks[i] = (last_block + 1, chunk_end)
+                    else:
+                        tron.INITIAL_BLOCKS[i] = 0
+                        logging.info("Chunk %d-%d not scraped at all, proceeding from start", chunk_start, chunk_end)
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -199,7 +222,7 @@ if __name__ == "__main__":
         chunks = get_chunks(STUB, args.start, args.end, args.chunk_size)
 
         tron.SCRAPED_BLOCKS = [0] * len(chunks)
-        tron.TRANSACTION_COUNT = [0] * len(chunks)
+        tron.INITIAL_BLOCKS = [0] * len(chunks)
 
         rpc_futures = []
         rpc_stop = threading.Event()
@@ -207,25 +230,7 @@ if __name__ == "__main__":
         db_stop_event = threading.Event()
         metrics_stop_event = threading.Event()
 
-        if args.proceed:
-            with psycopg.connect(args.pg) as conn:
-                with conn.cursor() as cur:
-                    for i, (chunk_start, chunk_end) in enumerate(chunks):
-                        cur.execute("SELECT MAX(id / 10000) FROM transactions WHERE id / 10000 >= %s AND id / 10000 <= %s", (chunk_start, chunk_end))
-                        result = cur.fetchone()
-                        if result and result[0]:
-                            last_block = result[0]
-                            if last_block >= chunk_end:
-                                tron.SCRAPED_BLOCKS[i] = chunk_end - chunk_start + 1
-                                tron.TRANSACTION_COUNT[i] = 0
-                                logging.info("Chunk %d-%d already fully scraped (up to block %d), skipping", chunk_start, chunk_end, last_block)
-                                chunks[i] = (chunk_end + 1, chunk_end)
-                            else:
-                                tron.SCRAPED_BLOCKS[i] = last_block - chunk_start + 1
-                                logging.info("Chunk %d-%d already partially scraped (up to block %d), proceeding from there", chunk_start, chunk_end, last_block)
-                                chunks[i] = (last_block + 1, chunk_end)
-                        else:
-                            logging.info("Chunk %d-%d not scraped at all, proceeding from start", chunk_start, chunk_end)
+        proceed_from_last_block_per_chunk(args, chunks)
 
         start_time = time.time()
 

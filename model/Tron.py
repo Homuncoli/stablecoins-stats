@@ -4,6 +4,8 @@ import hashlib
 import queue
 from datetime import datetime, timezone
 
+import base58
+
 type TokenType = str # 'TRX', 'TRC10', 'TRC20', 'TRC721'
 type TransactionType = str # 'TransferContract', 'TransferAssetContract', etc.
 # id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee
@@ -16,6 +18,9 @@ TF_COPY_TYPES = ["int8","int2","int8","int8", "int8", "int8", "int8","bool"]
 
 TRON_QUEUE_SIZE = 3_000
 TRON_QUEUE = queue.Queue[list[tuple[TransactionDTO, list[TransferDTO]]]](TRON_QUEUE_SIZE)
+
+def addr_to_tron(addr: bytes) -> str:
+    return base58.b58encode_check(addr).decode()
 
 def calc_trxID(trx) -> str:
         raw_bytes = trx.raw_data.SerializeToString()

@@ -24,6 +24,7 @@ from metrics import timed
 
 SCALER = 10_000
 SCRAPED_BLOCKS = []
+INITIAL_BLOCKS = []
 
 def __pair_transactions_with_infos(block, infos):
     info_by_txid = { info.id.hex(): info for info in infos.transactionInfo }
@@ -71,6 +72,10 @@ def __log_to_transfer_dto(id, j, trx, info, log, smart, logger):
 
 def __call_value_to_transfer_dto(id, j, trx, internal, call_value, logger):
     value_lo, value_hi = int_to_lo_hi(call_value.callValue)
+
+    if internal.transferTo_address is None or internal.transferTo_address == b'':
+        return None
+
     return (
         id,
         j,
@@ -143,16 +148,15 @@ def __trigger_smart_contract(block, trx, i, info, smart, logger: logging.Logger)
     for internal in info.internal_transactions:
         for call_value in internal.callValueInfo:
             tf: TransferDTO = __call_value_to_transfer_dto(id, j, trx, internal, call_value, logger)
-            tfs.append(tf)
             j += 1
+            if tf is not None:
+                tfs.append(tf)
 
     for log in info.log:
         tf: TransferDTO = __log_to_transfer_dto(id, j, trx, info, log, smart, logger)
+        j += 1
         if tf is not None:
             tfs.append(tf)
-            j += 1
-        else:
-            pass
 
     return tx, tfs
 

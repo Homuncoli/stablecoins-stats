@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 import threading
 
 from metrics import timed
@@ -33,8 +34,8 @@ class AddressStash:
         except Exception as e:
             logger.error(f"Error occurred while initializing address stash:", exc_info=e)
 
-    def refresh(self, cur, lock=True) -> int:
-        with timed("refresh", "stash"), self._state_lock if lock else threading.Lock():
+    def refresh(self, cur) -> int:
+        with timed("refresh", "stash"), self._state_lock:
             last_address_id = self._last_address_id
 
             cur.execute("SELECT id, addr FROM addresses WHERE id > %s ORDER BY id", (last_address_id,))
@@ -44,16 +45,17 @@ class AddressStash:
                 self._cache[address] = address_id
                 if address_id > self._last_address_id:
                     self._last_address_id = address_id
-
             return self._last_address_id
 
     def get(self, address: bytes) -> int | None:
-        return self._cache.get(address)
+        with self._state_lock:
+            return self._cache.get(address)
 
     def try_new(self, address: bytes, addr_type: str) -> bool:
         if address in self._cache:
             return False
-        self._new.setdefault(address, addr_type)
+        with self._state_lock:
+            self._new.setdefault(address, addr_type)
         return True
     
     def commit(self, cur, staging_table, logger) -> int:
@@ -64,40 +66,44 @@ class AddressStash:
             rows = list(self._new.items())
             self._new.clear()
 
-            logger.debug(f"Committing {len(rows)} new addresses to the database...")
-            with timed("commit", "stash"):
-                cur.execute(f"TRUNCATE TABLE addr_{staging_table}")
+        with timed("commit", "stash"):
+            cur.execute(f"TRUNCATE TABLE addr_{staging_table}")
 
-                copy_binary_rows(
-                    cur,
-                    rows,
-                    f"addr_{staging_table}",
-                    "addr, addr_t",
-                    ["bytea", "text"],
-                )
+            copy_binary_rows(
+                cur,
+                rows,
+                f"addr_{staging_table}",
+                "addr, addr_t",
+                ["bytea", "text"],
+            )
 
-                with ADDR_TABLE_LOCK:
-                    cur.execute(f"""
-                        INSERT INTO addresses (addr, addr_t)
-                        SELECT addr, addr_t::addr_type
-                        FROM addr_{staging_table}
-                        RETURNING id, addr
-                    """)
+            with ADDR_TABLE_LOCK:
+                cur.execute(f"""
+                    INSERT INTO addresses (addr, addr_t)
+                    SELECT addr, addr_t::addr_type
+                    FROM addr_{staging_table}
+                    RETURNING id, addr
+                """)
+
                 inserted_rows = cur.fetchall()
 
-                inserted_count = len(inserted_rows)
+            inserted_count = len(inserted_rows)
+            
+            with self._state_lock:
                 for address_id, address in inserted_rows:
+                    if address_id is None:
+                        logger.warning(f"Failed to insert address {address.hex()}, skipping.")
+                        continue
                     self._cache[address] = address_id
                     if address_id > self._last_address_id:
                         self._last_address_id = address_id
-
-                if inserted_count != len(rows):
-                    logger.warning(f"Expected to insert {len(rows)} addresses, but only {inserted_count} were inserted. This may indicate that some addresses already exist in the database.")
-                    self.refresh(cur, lock=False)
-                else:
-                    logger.debug(f"Inserted {inserted_count} new addresses into the database.")
-
-                return inserted_count
+            
+            if inserted_count != len(rows):
+                logger.warning(f"Expected to insert {len(rows)} addresses, but only {inserted_count} were inserted. This may indicate that some addresses already exist in the database.")
+                self.refresh(cur)
+            else:
+                logger.debug(f"Inserted {inserted_count} new addresses into the database.")
+            return inserted_count
         
     def size(self) -> int:
         return len(self._cache)

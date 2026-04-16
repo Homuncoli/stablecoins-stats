@@ -1,6 +1,7 @@
 import threading
 
 from metrics import timed
+from model.Tron import addr_to_tron
 from tron import address as address_module
 from db_schema import copy_binary_rows
 
@@ -56,26 +57,30 @@ class TokenStash:
         return self._last_token_id
 
     def get_by_address(self, address: bytes) -> int | None:
-        return self.by_address.get(address)
+        with self._state_lock:
+            return self.by_address.get(address)
 
     def get_by_asset_id(self, asset_id: int) -> int | None:
-        return self.by_asset_id.get(asset_id)
+        with self._state_lock:
+            return self.by_asset_id.get(asset_id)
 
     def try_new(self, address: int | None, asset_id: int | None, token_type: str) -> bool:
-        if (asset_id and asset_id in self.by_asset_id) or (address and address in self.by_address):
-            return False
-        if (address, asset_id, token_type) in self._new:
-            return False
-        self._new.add((address, asset_id, token_type))
+        with self._state_lock:
+            if (asset_id and asset_id in self.by_asset_id) or (address and address in self.by_address):
+                return False
+            if (address, asset_id, token_type) in self._new:
+                return False
+            self._new.add((address, asset_id, token_type))
         return True
     
     def try_new_unknown_contract(self, address: bytes, asset_id: int | None, token_type: str) -> bool:
-        if (asset_id and asset_id in self.by_asset_id):
-            return False
-        if (address, asset_id, token_type) in self._new_unknown_contract:
-            return False
-        self._new_unknown_contract.add((address, asset_id, token_type))
-        return True
+        with self._state_lock:
+            if (asset_id and asset_id in self.by_asset_id):
+                return False
+            if (address, asset_id, token_type) in self._new_unknown_contract:
+                return False
+            self._new_unknown_contract.add((address, asset_id, token_type))
+            return True
         
     
     def commit(self, cur, staging_table, logger) -> int:
@@ -90,10 +95,11 @@ class TokenStash:
         
         with timed("commit", "stash"):
             for address, asset_id, token_type in unresolved:
-                if address_module.ADDRESS_CACHE.get(address) is None:
-                    logger.warning(f"Unknown contract address {address.hex()} for token with asset_id {asset_id} and type {token_type}")
+                addr = address_module.ADDRESS_CACHE.get(address)
+                if addr is None:
+                    logger.warning(f"Unknown contract address {addr_to_tron(address)} for token with asset_id {asset_id} and type {token_type}")
                     continue
-                rows.append((address_module.ADDRESS_CACHE.get(address), asset_id, token_type))
+                rows.append((addr, asset_id, token_type))
 
             if len(rows) == 0:
                 return 0
@@ -121,12 +127,20 @@ class TokenStash:
             inserted_rows = cur.fetchall()
             inserted_count = len(inserted_rows)
 
-            if inserted_count > 0:
-                self.refresh(cur)
+            with self._state_lock:
+                for token_id, asset_id, contract_addr in inserted_rows:
+                    if asset_id is not None:
+                        self.by_asset_id[asset_id] = token_id
+                    if contract_addr is not None:
+                        self.by_address[contract_addr] = token_id
+                    if token_id > self._last_token_id:
+                        self._last_token_id = token_id
 
             if inserted_count != len(rows):
                 logger.warning(f"Expected to insert {len(rows)} tokens, but only {inserted_count} were inserted. This may indicate that some tokens already exist in the database.")
                 self.refresh(cur)
+            else:
+                logger.debug(f"Inserted {inserted_count} new tokens into the database.")
 
             self._new.clear()
             self._new_unknown_contract.clear()

@@ -17,6 +17,8 @@ from db_schema import copy_binary_rows
 
 MERGE_LOCK = threading.Lock()
 DB_SYNC_LOCK = threading.Lock()
+QUEUE_DRAIN_LOCK = threading.Lock()
+CACHE_LOCK = threading.Lock()
 TOTAL_CONSUMERS = 0
 
 BUFFERED_BLOCKS = []
@@ -116,28 +118,39 @@ def __merge_staging_table_with_retry(cur, staging_table: str, logger: logging.Lo
             )
             time.sleep(delay)
 
-def sync_staging(consumer_id, cur, staging_table: str, uncommited_blocks: int, unmerged_blocks: int, tx: list, resolved_tf: list, unresolved_tf: list, force: bool, commit_size: int, logger: logging.Logger) -> tuple[int, int]:
+def sync_staging(consumer_id, conn, cur, staging_table: str, uncommited_blocks: int, unmerged_blocks: int, tx: list, resolved_tf: list, unresolved_tf: list, force: bool, commit_size: int, logger: logging.Logger) -> tuple[int, int]:
     buffered_rows = len(tx) + len(resolved_tf) + len(unresolved_tf)
     should_flush_new_rows = buffered_rows > 0 and (force or uncommited_blocks >= commit_size)
 
     if not should_flush_new_rows:
         return uncommited_blocks, unmerged_blocks
     
+    released = False
     if should_flush_new_rows:
+        released = True
+
         DB_STATE[consumer_id] = "FORCE_FLUSH" if force else "FLUSH"
         logger.debug("flushing to staging table, buffered blocks: %d", uncommited_blocks)
         
         with timed("syncing", "db"):
             address_module.ADDRESS_CACHE.commit(cur, staging_table, logger)
             token_module.TOKEN_CACHE.commit(cur, staging_table, logger)
+            conn.commit()
 
         with timed("resolving", "db"):
             tfs = resolved_tf
-            # ToDo: Resolve as much as possible of the unresolved tfs here again after addresses and tokens have been committed, to reduce the number of unresolved tfs that need to be inserted with nulls and then updated later.
-
-        with timed("copying", "db"):
+            resolved_squared = [resolve_tf(tf) for tf in unresolved_tf]
+            tfs.extend([row for row, insert in resolved_squared if insert])
+            for row, insert in resolved_squared:
+                if not insert:
+                    logger.warning(f"unresolved transfer after resolving {row=}")
+                    unresolved_tf.append(row)
+            logger.debug("resolved %d transfers, %d remain unresolved", len(tfs) - len(resolved_tf), (len(resolved_tf) + len(unresolved_tf)) - len(tfs))
+           
+        with timed("copying", "db", log=True):
             copy_binary_rows(cur, tx, f"tx_{staging_table}", "id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee", TX_COPY_TYPES)
             copy_binary_rows(cur, tfs, f"tf_{staging_table}", "transaction, index, token, value_lo, value_hi, from_addr, to_addr, success", TF_COPY_TYPES)
+            conn.commit()
 
         COMMITED_BLOCKS[consumer_id] += uncommited_blocks
         unmerged_blocks += uncommited_blocks
@@ -148,22 +161,32 @@ def sync_staging(consumer_id, cur, staging_table: str, uncommited_blocks: int, u
         unresolved_tf.clear()
         
     if unmerged_blocks == 0:
+        DB_STATE[consumer_id] = "QUEUE"
+        if released:
+            QUEUE_DRAIN_LOCK.acquire()
         return uncommited_blocks, unmerged_blocks
     
     DB_STATE[consumer_id] = "LOCKING" if force else DB_STATE[consumer_id]
     if not DB_SYNC_LOCK.acquire(blocking=force):
-        return False
+        DB_STATE[consumer_id] = "QUEUE"
+        if released:
+            QUEUE_DRAIN_LOCK.acquire()
+        return uncommited_blocks, unmerged_blocks
     
     DB_STATE[consumer_id] = "MERGING"
     try:
         logger.info("merging staging table after processing %d blocks", unmerged_blocks)
         with timed("merging", "db"):
             __merge_staging_table_with_retry(cur, staging_table, logger)
+            conn.commit()
         MERGED_BLOCKS[consumer_id] += unmerged_blocks
         unmerged_blocks = 0
         return uncommited_blocks, 0
     finally:
         DB_SYNC_LOCK.release()
+        DB_STATE[consumer_id] = "QUEUE"
+        if released:
+            QUEUE_DRAIN_LOCK.acquire()
 
 def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Event, timeout: float | None, commit_size: int, merge_size: int, metrics: int):
     logger = logging.getLogger(f"db-consumer-{consumer_id}")
@@ -222,49 +245,51 @@ def db_consumer(pool: ConnectionPool, consumer_id: int, stop_event: threading.Ev
                     force = unmerged_blocks > merge_size
                     if force:
                         logger.info("force syncing staging table due to buffer size %d exceeding merge target %d", unmerged_blocks, merge_size)
-                    uncommited_blocks, unmerged_blocks = sync_staging(consumer_id, cur, staging_table, uncommited_blocks, unmerged_blocks, tx_buffer, resolved_tf_buffer, unresolved_tf_buffer, force, commit_size, logger)
+                    uncommited_blocks, unmerged_blocks = sync_staging(consumer_id, conn, cur, staging_table, uncommited_blocks, unmerged_blocks, tx_buffer, resolved_tf_buffer, unresolved_tf_buffer, force, commit_size, logger)
 
                 while uncommited_blocks > 0 or unmerged_blocks > 0:
                     logger.info("stopping, flushing and merging remaining blocks, uncommited: %d, unmerged: %d", uncommited_blocks, unmerged_blocks)
-                    uncommited_blocks, unmerged_blocks = sync_staging(consumer_id, cur, staging_table, uncommited_blocks, unmerged_blocks, tx_buffer, resolved_tf_buffer, unresolved_tf_buffer, True, commit_size, logger)
+                    uncommited_blocks, unmerged_blocks = sync_staging(consumer_id, conn, cur, staging_table, uncommited_blocks, unmerged_blocks, tx_buffer, resolved_tf_buffer, unresolved_tf_buffer, True, commit_size, logger)
 
+                QUEUE_DRAIN_LOCK.release()
                 logger.debug("stopped")
 
     except Exception as e:
         logger.fatal("fatal error", exc_info=e)
-        if DB_SYNC_LOCK.locked():
-            DB_SYNC_LOCK.release()
+        DB_SYNC_LOCK.release()
+        QUEUE_DRAIN_LOCK.release()
 
 def resolve_tf(tf):
-    insert = True
-    row = (tf[0], tf[1], 0, tf[5], tf[6], None, None, tf[11])
-    if tf[2]: # asset_id
-        if token_module.TOKEN_CACHE.get_by_asset_id(tf[2]) is not None:
-            row = row[:2] + (token_module.TOKEN_CACHE.get_by_asset_id(tf[2]),) + row[3:]
-        else:
-            token_module.TOKEN_CACHE.try_new(None, tf[2], tf[4])
-            insert = False
-    if tf[3]: # contract_addr
-        if token_module.TOKEN_CACHE.get_by_address(tf[3]) is not None:
-            row = row[:2] + (token_module.TOKEN_CACHE.get_by_address(tf[3]),) + row[3:]
-        else:
-            if address_module.ADDRESS_CACHE.get(tf[3]) is not None:
-                token_module.TOKEN_CACHE.try_new(address_module.ADDRESS_CACHE.get(tf[3]), None, tf[4])
+    with CACHE_LOCK:
+        insert = True
+        row = (tf[0], tf[1], 0, tf[5], tf[6], None, None, tf[11])
+        if tf[2]: # asset_id
+            if token_module.TOKEN_CACHE.get_by_asset_id(tf[2]) is not None:
+                row = row[:2] + (token_module.TOKEN_CACHE.get_by_asset_id(tf[2]),) + row[3:]
             else:
-                address_module.ADDRESS_CACHE.try_new(tf[3], "Contract")
-                token_module.TOKEN_CACHE.try_new_unknown_contract(tf[3], tf[2], tf[4])
-            insert = False
+                token_module.TOKEN_CACHE.try_new(None, tf[2], tf[4])
+                insert = False
+        if tf[3]: # contract_addr
+            if token_module.TOKEN_CACHE.get_by_address(tf[3]) is not None:
+                row = row[:2] + (token_module.TOKEN_CACHE.get_by_address(tf[3]),) + row[3:]
+            else:
+                if address_module.ADDRESS_CACHE.get(tf[3]) is not None:
+                    token_module.TOKEN_CACHE.try_new(address_module.ADDRESS_CACHE.get(tf[3]), None, tf[4])
+                else:
+                    address_module.ADDRESS_CACHE.try_new(tf[3], "Contract")
+                    token_module.TOKEN_CACHE.try_new_unknown_contract(tf[3], tf[2], tf[4])
+                insert = False
 
-    if tf[7]: # from_addr
-        if address_module.ADDRESS_CACHE.get(tf[7]) is not None:
-            row = row[:5] + (address_module.ADDRESS_CACHE.get(tf[7]),) + row[6:]
-        else:
-            address_module.ADDRESS_CACHE.try_new(tf[7], "EOA")
-            insert = False
-    if tf[9]: # to_addr
-        if address_module.ADDRESS_CACHE.get(tf[9]) is not None:
-            row = row[:6] + (address_module.ADDRESS_CACHE.get(tf[9]),) + row[7:]
-        else:
-            address_module.ADDRESS_CACHE.try_new(tf[9], "Unknown")
-            insert = False
-    return row,insert
+        if tf[7]: # from_addr
+            if address_module.ADDRESS_CACHE.get(tf[7]) is not None:
+                row = row[:5] + (address_module.ADDRESS_CACHE.get(tf[7]),) + row[6:]
+            else:
+                address_module.ADDRESS_CACHE.try_new(tf[7], "EOA")
+                insert = False
+        if tf[9]: # to_addr
+            if address_module.ADDRESS_CACHE.get(tf[9]) is not None:
+                row = row[:6] + (address_module.ADDRESS_CACHE.get(tf[9]),) + row[7:]
+            else:
+                address_module.ADDRESS_CACHE.try_new(tf[9], "Unknown")
+                insert = False
+        return row,insert
