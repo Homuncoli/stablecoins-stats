@@ -142,10 +142,27 @@ def sync_staging(consumer_id, conn, cur, staging_table: str, uncommited_blocks: 
             tfs = resolved_tf
             resolved_squared = [resolve_tf(tf) for tf in unresolved_tf]
             tfs.extend([row for row, insert in resolved_squared if insert])
-            for row, insert in resolved_squared:
-                if not insert:
-                    logger.warning(f"unresolved transfer after resolving {row=}")
-                    unresolved_tf.append(row)
+            still_unresolved = [row for row, insert in resolved_squared if not insert]
+            
+            # Second pass: commit newly-added addresses/tokens and retry resolution
+            if still_unresolved:
+                token_new, token_unresolved_new = token_module.TOKEN_CACHE.new_snapshot(logger)
+                addr_new = address_module.ADDRESS_CACHE.new_snapshot(logger)
+                if addr_new or token_new or token_unresolved_new:
+                    address_module.ADDRESS_CACHE.commit(cur, staging_table, addr_new, logger)
+                    token_module.TOKEN_CACHE.commit(cur, staging_table, token_new, token_unresolved_new, logger)
+                    
+                    # Retry resolution on previously unresolved transfers
+                    resolved_squared_retry = [resolve_tf(tf) for tf in still_unresolved]
+                    tfs.extend([row for row, insert in resolved_squared_retry if insert])
+                    for row, insert in resolved_squared_retry:
+                        if not insert:
+                            logger.warning(f"unresolved transfer after second resolve pass: {row=}")
+                            unresolved_tf.append(row)
+                else:
+                    for row in still_unresolved:
+                        logger.warning(f"unresolved transfer: {row=}")
+                        unresolved_tf.append(row)
            
         with timed("copying", "db"):
             copy_binary_rows(cur, tx, f"tx_{staging_table}", "id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee", TX_COPY_TYPES)
