@@ -23,8 +23,7 @@ from tron.generated.core.contract import smart_contract_pb2
 from metrics import timed
 
 SCALER = 10_000
-SCRAPE_PROGRESS = []
-TRANSACTION_COUNT = []
+SCRAPED_BLOCKS = []
 
 def __pair_transactions_with_infos(block, infos):
     info_by_txid = { info.id.hex(): info for info in infos.transactionInfo }
@@ -270,8 +269,7 @@ def __scrape_block(stub: tron_api.WalletStub, block_num: int, logger: logging.Lo
                     block_data.append((tx, tfs))
 
         TRON_QUEUE.put(block_data)
-        SCRAPE_PROGRESS[chunk_id] += 1
-        TRANSACTION_COUNT[chunk_id] += len(block_data)
+        SCRAPED_BLOCKS[chunk_id] += 1
 
     except Exception as e:
         logger.error("error processing block %d", block_num, exc_info=e)

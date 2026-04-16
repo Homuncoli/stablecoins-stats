@@ -73,3 +73,12 @@ def ensure_schema(conn: psycopg.Connection, dir: Path = Path("migrations")) -> N
             exit(1)
 
     logger.info("Database schema is up to date.")
+
+def copy_binary_rows(cur, buffer: list[tuple], target_table: str, columns: str, type_names: list[str]):
+    if not buffer:
+        return
+
+    with cur.copy(f"COPY {target_table} ({columns}) FROM STDIN WITH (FORMAT BINARY)") as copy:
+        copy.set_types(type_names)
+        for row in buffer:
+            copy.write_row(row)

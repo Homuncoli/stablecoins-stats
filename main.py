@@ -23,7 +23,9 @@ import grpc
 from metrics import TIMING, log_timings
 from model.Tron import TRON_QUEUE, TRON_QUEUE_SIZE
 from tron import scrape as tron
+from tron import address as address_module
 import tron.db_consumer as db_consumer_module
+from tron import token as token_module
 
 sys.path.insert(0, os.path.abspath('./tron/generated'))
 sys.path.insert(0, os.path.abspath('./'))
@@ -92,57 +94,46 @@ def monitor_metrics(db_stop, stop_event: threading.Event, args, rpc_futures: lis
                 smoothing=SMOOTHING,
                 leave=True) as buffered_pbar:
                 with tqdm(
-                    unit="transactions",
+                    total=args.chunk_size * len(rpc_futures),
+                    unit="blocks",
                     desc="Committed",
                     bar_format=PROGRESS_BAR_FORMAT,
                     smoothing=SMOOTHING,
                     leave=True) as committed_pbar:
                         with tqdm(
-                            unit="transactions",
+                            total=args.chunk_size * len(rpc_futures),
+                            unit="blocks",
                             desc="Merged",
                             bar_format=PROGRESS_BAR_FORMAT,
                             smoothing=SMOOTHING,
                             leave=False) as merged_pbar:
                             last_done = [0, 0, 0, 0]
                             while not stop_event.is_set():
-                                scraped = sum(tron.SCRAPE_PROGRESS)
-                                buffered = sum(db_consumer_module.BUFFER_PROGRESS)
-                                committed = sum(db_consumer_module.COMMIT_PROGRESS)
-                                merged = sum(db_consumer_module.MERGE_PROGRESS)
+                                scraped = sum(tron.SCRAPED_BLOCKS)
+                                buffered = sum(db_consumer_module.BUFFERED_BLOCKS)
+                                committed = sum(db_consumer_module.COMMITED_BLOCKS)
+                                merged = sum(db_consumer_module.MERGED_BLOCKS)
 
-                                current_queue_size = TRON_QUEUE.qsize()
-                                queue_size_total += current_queue_size
-                                queue_size_samples += 1
-                                queue_history.append(current_queue_size)
-                                if len(queue_history) > QUEUE_HISTORY_LIMIT:
-                                    del queue_history[:-QUEUE_HISTORY_LIMIT]
-                                if len(queue_history) >= 2:
-                                    #tqdm.write(render_queue_chart(queue_history))
-                                    pass
 
                                 scrape_pbar.update(scraped - last_done[0])
                                 buffered_pbar.update(buffered - last_done[1])
-                                buffered_pbar.set_postfix_str(f"queue={current_queue_size / TRON_QUEUE_SIZE:.0%}")
-
-                                total_transactions = sum(tron.TRANSACTION_COUNT)
-                                committed_pbar.total = total_transactions
-                                merged_pbar.total = total_transactions
+                                buffered_pbar.set_postfix_str(f"queue={TRON_QUEUE.qsize() / TRON_QUEUE_SIZE:.0%}")
 
                                 committed_pbar.update(committed - last_done[2])
-                                committed_pbar.set_postfix_str(f"addr={len(db_consumer_module.SHARED_ADDRESS_LOOKUP)} token={len(db_consumer_module.SHARED_TOKEN_LOOKUP_BY_CONTRACT) + len(db_consumer_module.SHARED_TOKEN_LOOKUP_BY_ASSET)}")
+                                if address_module.ADDRESS_CACHE is not None and token_module.TOKEN_CACHE is not None:
+                                    committed_pbar.set_postfix_str(f"addr={address_module.ADDRESS_CACHE.size()} token={token_module.TOKEN_CACHE.size()}")
                                 merged_pbar.update(merged - last_done[3])
-                                merged_pbar.set_postfix_str(",".join([f"uncommitted={uncommited / args.merge_size:.0%}" for uncommited in db_consumer_module.UNCOMMITTED_TRANSACTIONS]))
-
-                                committed_pbar.refresh()
-                                merged_pbar.refresh()
+                                total_lookups = sum(db_consumer_module.LOOKUP_HITS) + sum(db_consumer_module.LOOKUP_MISSES)
+                                if total_lookups > 0:
+                                    merged_pbar.set_postfix_str(f"hit:{sum(db_consumer_module.LOOKUP_HITS) / total_lookups:.0%}," + ",".join([f"unmerged={(committed - db_consumer_module.MERGED_BLOCKS[i])  / args.merge_size:.0%}" for i, commited in enumerate(db_consumer_module.COMMITED_BLOCKS)]))
                                 
                                 last_done = [scraped, buffered, committed, merged]
                                 time.sleep(interval)
 
-                            scraped = sum(tron.SCRAPE_PROGRESS)
-                            buffered = sum(db_consumer_module.BUFFER_PROGRESS)
-                            committed = sum(db_consumer_module.COMMIT_PROGRESS)
-                            merged = sum(db_consumer_module.MERGE_PROGRESS)
+                            scraped = sum(tron.SCRAPED_BLOCKS)
+                            buffered = sum(db_consumer_module.BUFFERED_BLOCKS)
+                            committed = sum(db_consumer_module.COMMITED_BLOCKS)
+                            merged = sum(db_consumer_module.MERGED_BLOCKS)
                                 
                             scrape_pbar.update(scraped - last_done[0])
                             buffered_pbar.update(buffered - last_done[1])
@@ -170,11 +161,12 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     db_consumer_module.TOTAL_CONSUMERS = args.db_consumers
-    db_consumer_module.BUFFER_PROGRESS = [0] * args.db_consumers
-    db_consumer_module.COMMIT_PROGRESS = [0] * args.db_consumers
-    db_consumer_module.MERGE_PROGRESS = [0] * args.db_consumers
+    db_consumer_module.BUFFERED_BLOCKS = [0] * args.db_consumers
+    db_consumer_module.COMMITED_BLOCKS = [0] * args.db_consumers
+    db_consumer_module.MERGED_BLOCKS = [0] * args.db_consumers
     db_consumer_module.DB_STATE = ["INIT"] * args.db_consumers
-    db_consumer_module.UNCOMMITTED_TRANSACTIONS = [0] * args.db_consumers
+    db_consumer_module.LOOKUP_HITS = [0] * args.db_consumers
+    db_consumer_module.LOOKUP_MISSES = [0] * args.db_consumers
 
     logging.basicConfig(level=getattr(logging, args.debug.upper()), format='%(asctime)s - %(name)s - %(levelname)s: %(message)s')
 
@@ -206,7 +198,7 @@ if __name__ == "__main__":
 
         chunks = get_chunks(STUB, args.start, args.end, args.chunk_size)
 
-        tron.SCRAPE_PROGRESS = [0] * len(chunks)
+        tron.SCRAPED_BLOCKS = [0] * len(chunks)
         tron.TRANSACTION_COUNT = [0] * len(chunks)
 
         rpc_futures = []
@@ -224,12 +216,12 @@ if __name__ == "__main__":
                         if result and result[0]:
                             last_block = result[0]
                             if last_block >= chunk_end:
-                                tron.SCRAPE_PROGRESS[i] = chunk_end - chunk_start + 1
+                                tron.SCRAPED_BLOCKS[i] = chunk_end - chunk_start + 1
                                 tron.TRANSACTION_COUNT[i] = 0
                                 logging.info("Chunk %d-%d already fully scraped (up to block %d), skipping", chunk_start, chunk_end, last_block)
                                 chunks[i] = (chunk_end + 1, chunk_end)
                             else:
-                                tron.SCRAPE_PROGRESS[i] = last_block - chunk_start + 1
+                                tron.SCRAPED_BLOCKS[i] = last_block - chunk_start + 1
                                 logging.info("Chunk %d-%d already partially scraped (up to block %d), proceeding from there", chunk_start, chunk_end, last_block)
                                 chunks[i] = (last_block + 1, chunk_end)
                         else:
@@ -334,6 +326,6 @@ if __name__ == "__main__":
         log_timings()
 
         end_time = time.time()
-        logging.info("Scraped blocks %d in %d seconds => %f blocks/s", sum(tron.SCRAPE_PROGRESS), end_time - start_time, sum(tron.SCRAPE_PROGRESS) / (end_time - start_time) if end_time - start_time > 0 else 0)
+        logging.info("Scraped blocks %d in %d seconds => %f blocks/s", sum(tron.SCRAPED_BLOCKS), end_time - start_time, sum(tron.SCRAPED_BLOCKS) / (end_time - start_time) if end_time - start_time > 0 else 0)
     finally:
         CHANNEL.close()

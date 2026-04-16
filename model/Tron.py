@@ -8,11 +8,11 @@ type TokenType = str # 'TRX', 'TRC10', 'TRC20', 'TRC721'
 type TransactionType = str # 'TransferContract', 'TransferAssetContract', etc.
 # id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee
 type TransactionDTO = tuple[int, bool, datetime, TransactionType, int, int, int, int]
-# transaction, index, transfer_type, token_asset_id, token_contract_addr, token_type, value, from_addr, from_type, to_addr, to_type, success 
-type TransferDTO = tuple[int, int, int, bytes, TokenType, int, bytes, str, bytes, str, bool] 
+# transaction, idx, asset_id, contract_addr, token_type, amount_lo, amount_hi, from_addr, from_type, to_addr, to_type, success
+type TransferDTO = tuple[int, int, bytes, bytes, str, int, int, bytes, str, bytes, str, bool] 
 
 TX_COPY_TYPES = ["int8", "bool", "timestamp", "text", "int8", "int8", "int8", "int8"]
-TF_COPY_TYPES = ["int8","int2","int8","bytea","text","int8","int8","bytea","text","bytea","text","bool"]
+TF_COPY_TYPES = ["int8","int2","int8","int8", "int8", "int8", "int8","bool"]
 
 TRON_QUEUE_SIZE = 3_000
 TRON_QUEUE = queue.Queue[list[tuple[TransactionDTO, list[TransferDTO]]]](TRON_QUEUE_SIZE)
@@ -117,20 +117,4 @@ def to_tx_binary_row(row: TransactionDTO):
         row[5],
         row[6],
         row[7],
-    )
-
-def to_tf_binary_row(row: TransferDTO):
-    return (
-        row[0],
-        row[1],
-        row[2],
-        row[3],
-        row[4],
-        row[5],
-        row[6],
-        row[7],
-        row[8],
-        row[9],
-        row[10],
-        row[11],
     )
