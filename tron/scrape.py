@@ -34,6 +34,8 @@ def __pair_transactions_with_infos(block, infos):
 def __transfer_log_to_transfer_dto(id, j, trx, info, log, smart, logger):
     if len(log.topics) < 3: # old encoding
         from_address, to_address, value = decode(['address', 'address', 'uint256'], log.data)
+        from_address = b'0x41' + from_address[2:].encode()
+        to_address = b'0x41' + to_address[2:].encode()
         value_lo, value_hi = int_to_lo_hi(value)
         print(calc_trxID(trx), from_address, to_address, value)
     else:
