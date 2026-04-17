@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+import logging
 import threading
 
 from metrics import timed
@@ -55,7 +56,7 @@ class AddressStash:
 
     def try_new(self, address: bytes, addr_type: str) -> bool:
         if not isinstance(address, bytes):
-            print(f"Trying to add address: {address} with type {type(address)} of {addr_type}")
+            logging.error(f"Trying to add address: {address} with type {type(address)} of {addr_type}")
             raise ValueError("String addresses are not supported in try_new. Please provide bytes-like input.")
         with self._state_lock:
             if address in self._cache:
