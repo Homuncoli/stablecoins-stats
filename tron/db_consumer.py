@@ -137,6 +137,7 @@ def sync_staging(consumer_id, conn, cur, staging_table: str, uncommited_blocks: 
             addr_new = address_module.ADDRESS_CACHE.new_snapshot(logger)
             address_module.ADDRESS_CACHE.commit(cur, staging_table, addr_new, logger)
             token_module.TOKEN_CACHE.commit(cur, staging_table, token_new, token_unresolved_new, logger)
+            conn.commit()
 
         with timed("resolving", "db"):
             tfs = resolved_tf
@@ -163,6 +164,7 @@ def sync_staging(consumer_id, conn, cur, staging_table: str, uncommited_blocks: 
                     for row in still_unresolved:
                         logger.warning(f"unresolved transfer: {row=}")
                         unresolved_tf.append(row)
+            conn.commit()
            
         with timed("copying", "db"):
             copy_binary_rows(cur, tx, f"tx_{staging_table}", "id, result, ts, transaction_t, fee_limit, fee, energy_usage, net_fee", TX_COPY_TYPES)
