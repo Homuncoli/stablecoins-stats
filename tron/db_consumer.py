@@ -141,9 +141,9 @@ def sync_staging(consumer_id, conn, cur, staging_table: str, uncommited_blocks: 
 
         with timed("resolving", "db"):
             tfs = resolved_tf
-            resolved_squared = [resolve_tf(tf) for tf in unresolved_tf]
-            tfs.extend([row for row, insert in resolved_squared if insert])
-            still_unresolved = [row for row, insert in resolved_squared if not insert]
+            resolved_squared = [(resolve_tf(tf), tf) for tf in unresolved_tf]
+            tfs.extend([row for (row, insert), tf in resolved_squared if insert])
+            still_unresolved = [tf for (row, insert), tf in resolved_squared if not insert]
             
             # Second pass: commit newly-added addresses/tokens and retry resolution
             if still_unresolved:
@@ -154,14 +154,14 @@ def sync_staging(consumer_id, conn, cur, staging_table: str, uncommited_blocks: 
                     token_module.TOKEN_CACHE.commit(cur, staging_table, token_new, token_unresolved_new, logger)
                     
                     # Retry resolution on previously unresolved transfers
-                    resolved_squared_retry = [resolve_tf(tf) for tf in still_unresolved]
-                    tfs.extend([row for row, insert in resolved_squared_retry if insert])
-                    for row, insert in resolved_squared_retry:
+                    resolved_squared_retry = [(resolve_tf(tf), tf) for tf in still_unresolved]
+                    tfs.extend([row for (row, insert), tf in resolved_squared_retry if insert])
+                    for (row, insert), tf in resolved_squared_retry:
                         if not insert:
                             logger.warning(f"unresolved transfer after second resolve pass: {row=}")
                             unresolved_tf.append(row)
                 else:
-                    for row in still_unresolved:
+                    for (row, insert), tf in resolved_squared_retry:
                         logger.warning(f"unresolved transfer: {row=}")
                         unresolved_tf.append(row)
             conn.commit()
